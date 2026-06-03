@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mima-governance"
+version = "0.1.0"
+description = "Mima AI Governance SDK — attest any AI execution in one line"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Mima", email = "sdk@mima.ai" }]
+keywords = ["ai", "governance", "attestation", "eu-ai-act", "compliance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "httpx>=0.24",
+    "pynacl>=1.5",
+]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.1"]
+llamaindex = ["llama-index-core>=0.10"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21", "respx>=0.20"]
+
+[project.urls]
+Documentation = "https://docs.mima.ai/sdk"
+Repository = "https://github.com/mima-ai/mima-governance-python"
