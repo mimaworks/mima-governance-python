@@ -419,11 +419,256 @@ def _cmd_test(args: List[str]) -> None:
     sys.exit(0 if suite.all_passed else 1)
 
 
+def _cmd_push(args: List[str]) -> None:
+    """Handle `mima push <record_type> [field=value ...] [--stdin] [--json]`.
+
+    Pushes a single GRC evidence record to the Mima API from the terminal
+    or a CI/CD pipeline step.
+
+    Usage:
+        mima push change_event \\
+            --by "ci-bot@company.com" \\
+            --description "Deploy v1.2.3 to production" \\
+            --environment production \\
+            --system api-service \\
+            --change-id "JIRA-1234"
+
+        echo '{"record_type":"change_event","by":"ci-bot",...}' | mima push --stdin
+
+    Supported record types and their required fields:
+
+        access_review    --user EMAIL --resource NAME --granted true|false
+                         --reviewed-by EMAIL [--review-type periodic|triggered|offboarding]
+
+        change_event     --by EMAIL --description TEXT --environment ENV --system NAME
+                         [--change-id ID]
+
+        vendor_risk      --vendor NAME --tier critical|high|medium|low
+                         --last-reviewed YYYY-MM-DD [--findings N]
+
+        policy_acknowledged  --policy NAME --user EMAIL --version VER
+                             [--channel in-app|email|slack]
+
+        incident_report  --title TEXT --severity critical|high|medium|low
+                         --description TEXT --affected-systems SYS1,SYS2
+                         [--detected-at ISO8601]
+    """
+    if not args or args[0] in ("-h", "--help"):
+        print(textwrap.dedent(_cmd_push.__doc__ or ""))
+        sys.exit(0)
+
+    from . import config
+
+    import os
+    api_key      = os.environ.get("MIMA_API_KEY")      or config.get_api_key()
+    workspace_id = os.environ.get("MIMA_WORKSPACE_ID") or config.get_workspace_id()
+    base_url     = os.environ.get("MIMA_BASE_URL")     or config.get_base_url()
+    system_name  = os.environ.get("MIMA_SYSTEM_NAME",  "mima-cli")
+
+    if not api_key or not workspace_id:
+        print("mima push: not logged in. Run `mima login` first.", file=sys.stderr)
+        sys.exit(1)
+
+    emit_json = "--json" in args
+    use_stdin = "--stdin" in args
+    clean_args = [a for a in args if a not in ("--json", "--stdin")]
+
+    # ── stdin JSON mode ──────────────────────────────────────────────────────
+    if use_stdin:
+        try:
+            raw = sys.stdin.read()
+            payload = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"mima push: invalid JSON on stdin — {e}", file=sys.stderr)
+            sys.exit(1)
+        record_type = payload.get("record_type")
+        if not record_type:
+            print("mima push: JSON must include \"record_type\".", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # ── positional record_type + flag parsing ────────────────────────────
+        if not clean_args:
+            print("mima push: specify a record_type or use --stdin. Run 'mima push --help'.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        record_type = clean_args[0]
+        valid_types = ("access_review", "change_event", "vendor_risk",
+                       "policy_acknowledged", "incident_report")
+        if record_type not in valid_types:
+            print(
+                f"mima push: unknown record_type '{record_type}'.\n"
+                f"  Valid types: {', '.join(valid_types)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Parse --key value flags from remaining args.
+        flags: dict = {}
+        i = 1
+        while i < len(clean_args):
+            if clean_args[i].startswith("--") and i + 1 < len(clean_args):
+                key = clean_args[i][2:].replace("-", "_")  # --reviewed-by → reviewed_by
+                flags[key] = clean_args[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        payload = _build_push_payload(record_type, flags)
+        if payload is None:
+            sys.exit(1)
+        payload["record_type"] = record_type
+
+    payload.setdefault("system_name", system_name)
+
+    # ── HTTP push ────────────────────────────────────────────────────────────
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/governance/grc/evidence"
+    try:
+        resp = httpx.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        body = e.response.text[:200]
+        print(f"mima push: API returned {e.response.status_code} — {body}", file=sys.stderr)
+        sys.exit(1)
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        print(f"mima push: cannot reach API — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+
+    if emit_json:
+        print(json.dumps(data, indent=2))
+    else:
+        record_id = data.get("record_id", "?")
+        controls  = data.get("mapped_controls", [])
+        print(f"Pushed {record_type}")
+        print(f"  record_id:       {record_id}")
+        print(f"  mapped_controls: {', '.join(controls) or '(none)'}")
+
+
+def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
+    """Build and validate the evidence payload from parsed CLI flags.
+
+    Returns None (after printing an error) if required fields are missing.
+    """
+
+    def require(*keys: str) -> bool:
+        missing = [k for k in keys if not flags.get(k)]
+        if missing:
+            flag_strs = ", ".join(f"--{k.replace('_', '-')}" for k in missing)
+            print(f"mima push {record_type}: missing required flag(s): {flag_strs}",
+                  file=sys.stderr)
+            return False
+        return True
+
+    if record_type == "access_review":
+        if not require("user", "resource", "granted", "reviewed_by"):
+            return None
+        granted_raw = flags["granted"].lower()
+        if granted_raw not in ("true", "false", "1", "0", "yes", "no"):
+            print("mima push: --granted must be true or false", file=sys.stderr)
+            return None
+        return {
+            "payload": {
+                "user":        flags["user"],
+                "resource":    flags["resource"],
+                "granted":     granted_raw in ("true", "1", "yes"),
+                "reviewed_by": flags["reviewed_by"],
+                "review_type": flags.get("review_type", "periodic"),
+                **({} if not flags.get("reason") else {"reason": flags["reason"]}),
+            },
+            "identity":    flags["user"],
+            "resource":    flags["resource"],
+        }
+
+    if record_type == "change_event":
+        if not require("by", "description", "environment", "system"):
+            return None
+        p = {
+            "payload": {
+                "type":        flags.get("type", "deployment"),
+                "by":          flags["by"],
+                "description": flags["description"],
+                "environment": flags["environment"],
+                "system":      flags["system"],
+            },
+            "identity":    flags["by"],
+            "resource":    flags["system"],
+            "environment": flags["environment"],
+        }
+        if flags.get("change_id"):
+            p["payload"]["change_id"] = flags["change_id"]
+        return p
+
+    if record_type == "vendor_risk":
+        if not require("vendor", "tier", "last_reviewed"):
+            return None
+        valid_tiers = ("critical", "high", "medium", "low")
+        if flags["tier"] not in valid_tiers:
+            print(f"mima push: --tier must be one of: {', '.join(valid_tiers)}", file=sys.stderr)
+            return None
+        return {
+            "payload": {
+                "vendor":        flags["vendor"],
+                "tier":          flags["tier"],
+                "last_reviewed": flags["last_reviewed"],
+                "findings":      int(flags.get("findings", "0")),
+            },
+            "resource": flags["vendor"],
+        }
+
+    if record_type == "policy_acknowledged":
+        if not require("policy", "user", "version"):
+            return None
+        return {
+            "payload": {
+                "policy":  flags["policy"],
+                "user":    flags["user"],
+                "version": flags["version"],
+                "channel": flags.get("channel", "in-app"),
+                **({} if not flags.get("session_id") else {"session_id": flags["session_id"]}),
+            },
+            "identity": flags["user"],
+            "resource":  flags["policy"],
+        }
+
+    if record_type == "incident_report":
+        if not require("title", "severity", "description", "affected_systems"):
+            return None
+        valid_severities = ("critical", "high", "medium", "low")
+        if flags["severity"] not in valid_severities:
+            print(f"mima push: --severity must be one of: {', '.join(valid_severities)}",
+                  file=sys.stderr)
+            return None
+        systems = [s.strip() for s in flags["affected_systems"].split(",") if s.strip()]
+        p: dict = {
+            "payload": {
+                "title":            flags["title"],
+                "severity":         flags["severity"],
+                "description":      flags["description"],
+                "affected_systems": systems,
+            },
+        }
+        if flags.get("detected_at"):
+            p["occurred_at"] = flags["detected_at"]
+        return p
+
+    return None
+
+
 _COMMANDS = {
     "scan":   _cmd_scan,
     "login":  _cmd_login,
     "status": _cmd_status,
     "test":   _cmd_test,
+    "push":   _cmd_push,
 }
 
 
@@ -436,18 +681,23 @@ def main() -> None:
             mima — AI governance CLI
 
             Commands:
-                mima scan <path>       Detect unattested AI call sites
-                mima test <file>       Run governance policy assertions
-                mima status            Show certification readiness scores
-                mima login             Authenticate with the Mima API
+                mima scan <path>          Detect unattested AI call sites
+                mima test <file>          Run governance policy assertions
+                mima status               Show certification readiness scores
+                mima login                Authenticate with the Mima API
+                mima push <record_type>   Push a GRC evidence record from CI/CD
 
             Run `mima <command> --help` for command-specific options.
 
             Quick start:
-                mima login                         # store API credentials
-                mima scan .                        # find unattested AI calls
-                mima test tests/test_governance.py # run policy tests
-                mima status                        # check readiness scores
+                mima login                              # store API credentials
+                mima scan .                             # find unattested AI calls
+                mima test tests/test_governance.py      # run policy tests
+                mima status                             # check readiness scores
+                mima push change_event --by ci \\       # push evidence from CI/CD
+                    --description "Deploy v1.2" \\
+                    --environment production \\
+                    --system api-service
         """))
         sys.exit(0)
 
