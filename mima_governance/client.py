@@ -370,7 +370,8 @@ class MimaGovernance:
     ) -> GrcResult:
         """Record an access review decision.
 
-        Evidences SOC2 CC6.1 (Logical Access Controls) and ISO 27001:2022 5.16.
+        Evidences SOC2 CC6.1 / CC6.2 / CC6.3 (Logical Access Controls) and
+        ISO 27001:2022 5.16 / 5.18, plus ISO 42001 A.9.2.
 
         Args:
             user:        The identity whose access was reviewed.
@@ -415,7 +416,8 @@ class MimaGovernance:
     ) -> GrcResult:
         """Record a system change event.
 
-        Evidences SOC2 CC8.1 (Change Management) and ISO 27001:2022 8.32.
+        Evidences SOC2 CC8.1 (Change Management), ISO 27001:2022 8.32, and
+        ISO 42001 A.6.2 (AI system lifecycle change control).
 
         Args:
             type:        Change type (e.g. "deployment", "config", "schema").
@@ -460,7 +462,8 @@ class MimaGovernance:
     ) -> GrcResult:
         """Record a vendor risk assessment.
 
-        Evidences SOC2 C1.2 (Vendor Risk Management) and ISO 27001:2022 5.19.
+        Evidences SOC2 CC9.2 (Vendor/Partner Risk Assessment), ISO 27001:2022
+        5.19 / 5.22 (supplier relationships and monitoring), and ISO 42001 A.10.3.
 
         Args:
             vendor:       Name of the vendor.
@@ -510,7 +513,9 @@ class MimaGovernance:
     ) -> GrcResult:
         """Record a policy acknowledgment by a user.
 
-        Evidences SOC2 CC1.4 (Commitment to Competence) and ISO 27001:2022 6.3.
+        Evidences SOC2 CC1.4 / CC5.3 (Commitment to Competence; deploying controls
+        through policy), ISO 27001:2022 6.3 (awareness and training), and
+        ISO 42001 A.2.2 (responsibility for AI objectives).
 
         Args:
             policy:     Name or identifier of the policy acknowledged.
@@ -552,7 +557,9 @@ class MimaGovernance:
     ) -> GrcResult:
         """Record a security or AI incident.
 
-        Evidences SOC2 CC7.3 (Incident Response) and ISO 27001:2022 5.26.
+        Evidences SOC2 CC7.3 / CC7.4 (incident detection and response),
+        ISO 27001:2022 5.25 / 5.26 (event assessment and incident response),
+        and ISO 42001 A.3.2 (reporting of AI incidents).
 
         Args:
             title:            Short title for the incident.
