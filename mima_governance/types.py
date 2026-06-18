@@ -1,7 +1,7 @@
 """Shared types for the Mima Governance SDK."""
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -41,3 +41,30 @@ class AttestationRecord:
     model_id: Optional[str] = None
     executed_at: Optional[str] = None
     authorised_by: Optional[AuthorisedBy] = None
+
+
+@dataclass
+class GrcRecord:
+    """A GRC control evidence record to be pushed to the Mima ledger."""
+
+    record_type: str
+    payload: dict
+    system_name: str
+    identity: Optional[str] = None
+    resource: Optional[str] = None
+    environment: Optional[str] = None
+    occurred_at: Optional[str] = None
+
+
+@dataclass
+class GrcResult:
+    """Result from pushing a GRC evidence record to the Mima ledger.
+
+    Check ``record_id == ''`` to detect a failed push — the SDK never raises
+    on network errors; failures are surfaced via ``detail`` and a stderr warning.
+    """
+
+    record_id: str
+    record_type: str
+    mapped_controls: List[str]
+    detail: str

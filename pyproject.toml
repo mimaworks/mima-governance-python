@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mima-governance"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mima AI Governance SDK — attest any AI execution in one line"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -25,7 +25,11 @@ dependencies = [
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.1"]
 llamaindex = ["llama-index-core>=0.10"]
-dev = ["pytest>=7", "pytest-asyncio>=0.21", "respx>=0.20"]
+autogen = ["pyautogen>=0.2"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21", "respx>=0.20", "pytest-mock>=3.10"]
+
+[project.scripts]
+mima = "mima_governance.cli:main"
 
 [project.urls]
 Documentation = "https://docs.mima.ai/sdk"

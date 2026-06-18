@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
-from .types import AttestationRecord, AttestationResult, AuthorisedBy
+from .types import AttestationRecord, AttestationResult, AuthorisedBy, GrcRecord, GrcResult
 
 
 class MimaAttestationError(Exception):
@@ -296,6 +296,297 @@ class MimaGovernance:
         sig_hex = signed.signature.hex()
         vk_hex = signing_key.verify_key.encode().hex()
         return sig_hex, vk_hex
+
+    # ── GRC: internal helpers ────────────────────────────────────────────────
+
+    def _build_grc_payload(self, record: GrcRecord) -> dict:
+        """Serialize a GrcRecord into the wire format, dropping None fields."""
+        base = {
+            "record_type": record.record_type,
+            "payload":     record.payload,
+            "system_name": record.system_name,
+        }
+        optional = {
+            "identity":    record.identity,
+            "resource":    record.resource,
+            "environment": record.environment,
+            "occurred_at": record.occurred_at,
+        }
+        return {**base, **{k: v for k, v in optional.items() if v is not None}}
+
+    def _push_grc(self, record: GrcRecord) -> GrcResult:
+        """Push a single GRC evidence record synchronously.
+
+        GRC evidence is always synchronous — missed control evidence is a
+        compliance gap, not a retryable metric.
+
+        Check ``result.record_id == ''`` to detect a failed push.
+        """
+        payload = self._build_grc_payload(record)
+        try:
+            resp = self._http.post(
+                f"/api/workspaces/{self.workspace_id}/governance/grc/evidence",
+                json=payload,
+            )
+            if resp.status_code >= 400:
+                return self._handle_grc_error(
+                    f"GRC push failed: HTTP {resp.status_code} — {resp.text}",
+                    record,
+                )
+            data = resp.json()
+            return GrcResult(
+                record_id=data["record_id"],
+                record_type=data["record_type"],
+                mapped_controls=data.get("mapped_controls", []),
+                detail="ok",
+            )
+        except httpx.TimeoutException:
+            return self._handle_grc_error("GRC push timed out (15s)", record)
+        except Exception as e:
+            return self._handle_grc_error(f"GRC push error: {e}", record)
+
+    def _handle_grc_error(self, message: str, record: GrcRecord) -> GrcResult:
+        """Warn on stderr and return an empty GrcResult. Never raises for GRC errors."""
+        import warnings
+        warnings.warn(f"[mima-governance] {message}", stacklevel=4)
+        return GrcResult(
+            record_id="",
+            record_type=record.record_type,
+            mapped_controls=[],
+            detail=message,
+        )
+
+    # ── GRC: public methods ──────────────────────────────────────────────────
+
+    def access_review(
+        self,
+        user: str,
+        resource: str,
+        granted: bool,
+        *,
+        reviewed_by: str,
+        review_type: str = "periodic",
+        reason: Optional[str] = None,
+    ) -> GrcResult:
+        """Record an access review decision.
+
+        Evidences SOC2 CC6.1 (Logical Access Controls) and ISO 27001:2022 5.16.
+
+        Args:
+            user:        The identity whose access was reviewed.
+            resource:    The system or resource the access applies to.
+            granted:     Whether access was granted (True) or revoked (False).
+            reviewed_by: Identity of the reviewer (keyword-only).
+            review_type: "periodic" (default), "triggered", or "offboarding".
+            reason:      Optional justification for the decision.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+        """
+        payload: Dict[str, Any] = {
+            "user":        user,
+            "resource":    resource,
+            "granted":     granted,
+            "reviewed_by": reviewed_by,
+            "review_type": review_type,
+        }
+        if reason is not None:
+            payload["reason"] = reason
+
+        record = GrcRecord(
+            record_type="access_review",
+            payload=payload,
+            system_name=self.system_name,
+            identity=user,
+            resource=resource,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return self._push_grc(record)
+
+    def change_event(
+        self,
+        type: str,
+        by: str,
+        description: str,
+        *,
+        environment: str,
+        system: str,
+        change_id: Optional[str] = None,
+    ) -> GrcResult:
+        """Record a system change event.
+
+        Evidences SOC2 CC8.1 (Change Management) and ISO 27001:2022 8.32.
+
+        Args:
+            type:        Change type (e.g. "deployment", "config", "schema").
+            by:          Identity who made the change.
+            description: Human-readable description of what changed.
+            environment: Target environment (keyword-only, e.g. "production").
+            system:      Name of the system that was changed (keyword-only).
+            change_id:   Optional ticket / change-request ID.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+        """
+        payload: Dict[str, Any] = {
+            "type":        type,
+            "by":          by,
+            "description": description,
+            "environment": environment,
+            "system":      system,
+        }
+        if change_id is not None:
+            payload["change_id"] = change_id
+
+        record = GrcRecord(
+            record_type="change_event",
+            payload=payload,
+            system_name=self.system_name,
+            identity=by,
+            resource=system,
+            environment=environment,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return self._push_grc(record)
+
+    def vendor_risk(
+        self,
+        vendor: str,
+        tier: str,
+        *,
+        last_reviewed: str,
+        findings: int = 0,
+        contacts: Optional[list] = None,
+    ) -> GrcResult:
+        """Record a vendor risk assessment.
+
+        Evidences SOC2 C1.2 (Vendor Risk Management) and ISO 27001:2022 5.19.
+
+        Args:
+            vendor:       Name of the vendor.
+            tier:         Risk tier — must be "critical", "high", "medium", or "low".
+            last_reviewed: ISO 8601 date when the assessment was completed (keyword-only).
+            findings:     Number of open findings from the review.
+            contacts:     Optional list of vendor contact identities.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+
+        Raises:
+            ValueError: If ``tier`` is not one of the four valid values.
+        """
+        valid_tiers = ("critical", "high", "medium", "low")
+        if tier not in valid_tiers:
+            raise ValueError(
+                f"vendor_risk tier must be one of {valid_tiers}, got '{tier}'"
+            )
+
+        payload: Dict[str, Any] = {
+            "vendor":        vendor,
+            "tier":          tier,
+            "last_reviewed": last_reviewed,
+            "findings":      findings,
+        }
+        if contacts is not None:
+            payload["contacts"] = contacts
+
+        record = GrcRecord(
+            record_type="vendor_risk",
+            payload=payload,
+            system_name=self.system_name,
+            resource=vendor,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return self._push_grc(record)
+
+    def policy_acknowledged(
+        self,
+        policy: str,
+        user: str,
+        *,
+        version: str,
+        channel: str = "in-app",
+        session_id: Optional[str] = None,
+    ) -> GrcResult:
+        """Record a policy acknowledgment by a user.
+
+        Evidences SOC2 CC1.4 (Commitment to Competence) and ISO 27001:2022 6.3.
+
+        Args:
+            policy:     Name or identifier of the policy acknowledged.
+            user:       Identity of the user who acknowledged.
+            version:    Policy version acknowledged (keyword-only).
+            channel:    How acknowledgment was captured (keyword-only, default "in-app").
+            session_id: Optional session ID for full audit trail reconstruction.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+        """
+        payload: Dict[str, Any] = {
+            "policy":  policy,
+            "user":    user,
+            "version": version,
+            "channel": channel,
+        }
+        if session_id is not None:
+            payload["session_id"] = session_id
+
+        record = GrcRecord(
+            record_type="policy_acknowledged",
+            payload=payload,
+            system_name=self.system_name,
+            identity=user,
+            resource=policy,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return self._push_grc(record)
+
+    def incident_report(
+        self,
+        title: str,
+        severity: str,
+        *,
+        description: str,
+        affected_systems: list,
+        detected_at: Optional[str] = None,
+    ) -> GrcResult:
+        """Record a security or AI incident.
+
+        Evidences SOC2 CC7.3 (Incident Response) and ISO 27001:2022 5.26.
+
+        Args:
+            title:            Short title for the incident.
+            severity:         Must be "critical", "high", "medium", or "low".
+            description:      Full description of what occurred (keyword-only).
+            affected_systems: List of system names affected (keyword-only).
+            detected_at:      ISO 8601 timestamp of detection; defaults to now().
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+
+        Raises:
+            ValueError: If ``severity`` is not one of the four valid values.
+        """
+        valid_severities = ("critical", "high", "medium", "low")
+        if severity not in valid_severities:
+            raise ValueError(
+                f"incident_report severity must be one of {valid_severities}, got '{severity}'"
+            )
+
+        occurred = detected_at or datetime.now(timezone.utc).isoformat()
+
+        record = GrcRecord(
+            record_type="incident_report",
+            payload={
+                "title":            title,
+                "severity":         severity,
+                "description":      description,
+                "affected_systems": affected_systems,
+            },
+            system_name=self.system_name,
+            occurred_at=occurred,
+        )
+        return self._push_grc(record)
 
     # ── Error handling ───────────────────────────────────────────────────────
 
