@@ -26,9 +26,12 @@ def load() -> dict:
 
 
 def save(config: dict) -> None:
-    """Persist config to ~/.mima/config.json."""
+    """Persist config to ~/.mima/config.json with owner-only (0o600) permissions."""
+    import os
     _ensure_dir()
     _CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    # Restrict to owner read/write — API key must not be world-readable.
+    os.chmod(_CONFIG_FILE, 0o600)
 
 
 def get_api_key() -> Optional[str]:

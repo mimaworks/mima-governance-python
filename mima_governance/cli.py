@@ -604,7 +604,7 @@ def _cmd_status(args: List[str]) -> None:
     active_fws = [fw for fw in data.get("frameworks", []) if fw["controls_required"] > 0]
     weakest = min(active_fws, key=lambda f: f["score_pct"], default=None)
     weakest_label = fw_labels.get(weakest["framework"], weakest["framework"]) if weakest else ""
-    print(f"\n  Overall: {overall}%  (weakest link: {weakest_label})")
+    print(f"\n  Overall: {overall}%  \u00b7  minimum across frameworks (weakest link: {weakest_label})")
 
     if unvalidated_labels:
         names = ", ".join(unvalidated_labels)
