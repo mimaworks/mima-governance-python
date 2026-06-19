@@ -118,50 +118,124 @@ def _scan_file(path: Path) -> Iterator[Detection]:
         )
 
 
-def _scan_path(root: Path, include: str = "**/*.py") -> List[Detection]:
-    """Walk root recursively and collect all detections."""
+_DEFAULT_EXCLUDE_PATTERNS = frozenset([
+    "*/mima_governance/*",
+    "*/.venv/*",
+    "*/venv/*",
+    "*/node_modules/*",
+    "*/__pycache__/*",
+    "*/.git/*",
+])
+
+
+def _is_excluded(path: Path, exclude_patterns: frozenset) -> bool:
+    """Check if a path matches any exclude pattern."""
+    path_str = str(path)
+    for pattern in exclude_patterns:
+        # Simple glob-like matching: * matches any segment
+        import fnmatch
+        if fnmatch.fnmatch(path_str, pattern):
+            return True
+    return False
+
+
+def _scan_path(
+    root: Path,
+    include: str = "**/*.py",
+    exclude: "frozenset | None" = None,
+    verbose: bool = False,
+) -> "tuple[List[Detection], int]":
+    """Walk root recursively and collect all detections.
+
+    Returns (detections, files_scanned).
+    """
     if not root.exists():
         print(f"mima scan: path not found: {root}", file=sys.stderr)
         sys.exit(1)
 
-    paths = list(root.rglob(include)) if root.is_dir() else [root]
+    exclude_patterns = exclude if exclude is not None else _DEFAULT_EXCLUDE_PATTERNS
+
+    all_paths = list(root.rglob(include)) if root.is_dir() else [root]
+    eligible = [p for p in all_paths
+                if p.suffix == ".py" and not _is_excluded(p, exclude_patterns)]
+
+    if verbose and len(eligible) > 20:
+        print(f"  Scanning {len(eligible):,} Python files...", end=" ", flush=True)
+
     detections: List[Detection] = []
-    for p in paths:
-        if p.suffix == ".py":
-            detections.extend(_scan_file(p))
-    return detections
+    for p in eligible:
+        detections.extend(_scan_file(p))
+
+    if verbose and len(eligible) > 20:
+        print("done")
+
+    return detections, len(eligible)
 
 
-def _print_text(detections: List[Detection]) -> None:
-    unattested = [d for d in detections if not d.attested and d.confidence == "high"]
-    low_conf   = [d for d in detections if not d.attested and d.confidence == "low"]
+def _print_text(
+    detections: List[Detection],
+    files_scanned: int = 0,
+    duration_ms: float = 0.0,
+) -> None:
+    unattested     = [d for d in detections if not d.attested and d.confidence == "high"]
+    low_conf       = [d for d in detections if not d.attested and d.confidence == "low"]
+    attested_count = sum(1 for d in detections if d.attested)
+    total_high     = len(unattested) + attested_count
+
+    timing = f"  ({duration_ms:.0f}ms)" if duration_ms else ""
 
     if not detections:
-        print("mima scan: no AI library call sites found.")
+        print(f"\n  No AI library call sites found in {files_scanned:,} files.{timing}\n")
         return
 
+    # ── Summary line ──────────────────────────────────────────────────────────
+    coverage_pct = int(attested_count / total_high * 100) if total_high else 0
+    parts = []
     if unattested:
-        print(f"mima scan: {len(unattested)} unattested AI call site(s) found:\n")
-        for d in unattested:
-            print(f"  {d.file}:{d.line}  [{d.library}]")
-        print()
-
-    if low_conf:
-        print(
-            f"  {len(low_conf)} low-confidence detection(s) (string/comment mentions, "
-            "aliased imports — review manually):"
-        )
-        for d in low_conf:
-            print(f"  {d.file}:{d.line}  [{d.library}] (low confidence)")
-        print()
-
-    attested_count = sum(1 for d in detections if d.attested)
+        parts.append(f"{len(unattested)} unattested")
     if attested_count:
-        print(f"  {attested_count} attested call site(s) — covered by @mima decorator.")
+        parts.append(f"{attested_count} attested")
+    if low_conf:
+        parts.append(f"{len(low_conf)} low-confidence")
+    summary = "  " + "  ·  ".join(parts)
+    if total_high:
+        summary += f"  ·  {coverage_pct}% coverage"
+    print(f"\n{summary}{timing}\n")
+
+    # ── Unattested (high confidence) ──────────────────────────────────────────
+    if unattested:
+        print("  UNATTESTED — add @mima.attest() decorator:")
+        for d in unattested:
+            relpath = d.file
+            print(f"    {relpath}:{d.line:<6}  {d.library}")
+        print()
+
+    # ── Low confidence ────────────────────────────────────────────────────────
+    if low_conf:
+        print("  LOW CONFIDENCE — review manually (aliased import or string/comment mention):")
+        for d in low_conf:
+            print(f"    {d.file}:{d.line:<6}  {d.library}")
+        print()
+
+    # ── Attested summary ──────────────────────────────────────────────────────
+    if attested_count:
+        print(f"  {attested_count} attested call site(s) covered by @mima.attest().\n")
+
+    # ── Fix hint (only when there are unattested calls) ───────────────────────
+    if unattested:
+        lib = unattested[0].library
+        print("  How to fix — wrap the call with @mima.attest():\n")
+        print("    from mima_governance import MimaGovernance")
+        print("    mima = MimaGovernance(workspace_id=\"...\", api_key=\"...\")\n")
+        print("    @mima.attest(tool_name=\"describe_this_call\")")
+        print("    def your_function(...):")
+        print(f"        return {lib}.your_call(...)  # ← this call is now evidenced\n")
+        print("  Use --strict to exit 1 on unattested findings (CI/CD gate).")
+        print("  Run `mima status` to see how attestation affects compliance scores.\n")
 
 
 def _cmd_scan(args: List[str]) -> None:
-    """Handle `mima scan <path> [--json] [--include PATTERN]`."""
+    """Handle `mima scan <path> [--json] [--strict] [--include PATTERN] [--exclude PATTERN]`."""
     if not args or args[0] in ("-h", "--help"):
         print(textwrap.dedent("""\
             mima scan — detect unattested AI call sites in Python source code
@@ -170,8 +244,13 @@ def _cmd_scan(args: List[str]) -> None:
                 mima scan <path> [options]
 
             Options:
+                --strict            Exit 1 if any unattested high-confidence call sites
+                                    are found. Use this as a CI/CD gate.
                 --json              Emit JSON array of detections to stdout
                 --include PATTERN   Glob pattern for files (default: **/*.py)
+                --exclude PATTERN   Glob pattern to exclude (repeatable)
+                --no-default-excludes  Disable built-in excludes (mima_governance/,
+                                       .venv/, node_modules/, __pycache__/, .git/)
                 -h, --help          Show this message
 
             Known limitations:
@@ -183,8 +262,11 @@ def _cmd_scan(args: List[str]) -> None:
         """))
         sys.exit(0)
 
-    emit_json = "--json" in args
-    include = "**/*.py"
+    emit_json           = "--json" in args
+    no_default_excludes = "--no-default-excludes" in args
+    strict              = "--strict" in args
+    include             = "**/*.py"
+    extra_excludes: List[str] = []
 
     cleaned: List[str] = []
     i = 0
@@ -192,7 +274,10 @@ def _cmd_scan(args: List[str]) -> None:
         if args[i] == "--include" and i + 1 < len(args):
             include = args[i + 1]
             i += 2
-        elif args[i] not in ("--json",):
+        elif args[i] == "--exclude" and i + 1 < len(args):
+            extra_excludes.append(args[i + 1])
+            i += 2
+        elif args[i] not in ("--json", "--no-default-excludes", "--strict"):
             cleaned.append(args[i])
             i += 1
         else:
@@ -203,7 +288,17 @@ def _cmd_scan(args: List[str]) -> None:
         sys.exit(1)
 
     root = Path(cleaned[0])
-    detections = _scan_path(root, include)
+    if no_default_excludes:
+        exclude = frozenset(extra_excludes) if extra_excludes else frozenset()
+    else:
+        exclude = _DEFAULT_EXCLUDE_PATTERNS | frozenset(extra_excludes)
+
+    import time
+    t0 = time.perf_counter()
+    detections, files_scanned = _scan_path(
+        root, include, exclude=exclude, verbose=not emit_json
+    )
+    duration_ms = (time.perf_counter() - t0) * 1000
 
     if emit_json:
         output = [
@@ -218,16 +313,21 @@ def _cmd_scan(args: List[str]) -> None:
         ]
         print(json.dumps(output, indent=2))
     else:
-        _print_text(detections)
+        _print_text(detections, files_scanned=files_scanned, duration_ms=duration_ms)
+
+    if strict:
+        unattested_count = sum(1 for d in detections if not d.attested and d.confidence == "high")
+        if unattested_count:
+            sys.exit(1)
 
 
 def _cmd_login(args: List[str]) -> None:
     """Handle `mima login [--api-key KEY] [--workspace-id ID] [--url URL]`."""
     from . import config
 
-    api_key = None
+    api_key      = None
     workspace_id = None
-    base_url = "https://api.mima.ai"
+    base_url     = "https://api.mima.ai"
 
     i = 0
     while i < len(args):
@@ -256,53 +356,141 @@ def _cmd_login(args: List[str]) -> None:
         else:
             i += 1
 
-    # Interactive mode if flags not provided.
-    # Use getpass for API key — keeps it out of terminal recordings and
-    # prevents shoulder-surfing exposure.
+    # Interactive mode — use getpass for the API key to keep it out of terminal
+    # recordings and shell history.
     import getpass
+    print()
     if not api_key:
+        print("  Find your API key: dashboard \u2192 Settings \u2192 API Keys\n")
         try:
-            api_key = getpass.getpass("API key: ").strip()
+            api_key = getpass.getpass("  API key (mima_ext_...): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nAborted.")
             sys.exit(1)
     if not workspace_id:
         try:
-            workspace_id = input("Workspace ID: ").strip()
+            workspace_id = input("  Workspace ID:           ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nAborted.")
             sys.exit(1)
 
     if not api_key or not workspace_id:
-        print("mima login: both API key and workspace ID are required.", file=sys.stderr)
+        print("\nmima login: both API key and workspace ID are required.", file=sys.stderr)
         sys.exit(1)
 
-    # Verify credentials by hitting the readiness endpoint
+    print("\n  Verifying credentials...", end=" ", flush=True)
+
     import httpx
 
     url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/governance/grc/readiness"
+    resp = None
     try:
         resp = httpx.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
         if resp.status_code == 401:
+            print("failed")
             print("mima login: invalid API key (401 Unauthorized).", file=sys.stderr)
             sys.exit(1)
         if resp.status_code == 403:
+            print("failed")
             print("mima login: access denied for this workspace (403 Forbidden).", file=sys.stderr)
             sys.exit(1)
+        if resp.status_code == 404:
+            print("failed")
+            print("mima login: workspace not found — check your workspace ID.", file=sys.stderr)
+            sys.exit(1)
         if resp.status_code >= 500:
+            print("failed")
             print(f"mima login: server error ({resp.status_code}). Try again later.", file=sys.stderr)
             sys.exit(1)
     except httpx.ConnectError:
+        print("failed")
         print(f"mima login: cannot reach {base_url} — check your network or --url flag.", file=sys.stderr)
         sys.exit(1)
     except httpx.TimeoutException:
+        print("failed")
         print(f"mima login: connection timed out to {base_url}.", file=sys.stderr)
         sys.exit(1)
 
+    print("\u2713")
+
     config.set_credentials(api_key, workspace_id, base_url)
-    print(f"Authenticated. Credentials saved to ~/.mima/config.json")
-    print(f"  Workspace: {workspace_id}")
-    print(f"  Endpoint:  {base_url}")
+    print(f"\n  Workspace:  {workspace_id}")
+    print(f"  Endpoint:   {base_url}")
+    print(f"  Saved to:   ~/.mima/config.json")
+
+    # Show current posture from the readiness response already fetched — free data.
+    if resp is not None and resp.status_code == 200:
+        fw_labels = {
+            "soc2_type2": "SOC 2 Type II",
+            "iso_27001":  "ISO 27001:2022",
+            "iso_42001":  "ISO 42001",
+            "eu_ai_act":  "EU AI Act",
+            "nist_airf":  "NIST AI RMF",
+        }
+        readiness = resp.json()
+        active = [fw for fw in readiness.get("frameworks", []) if fw["controls_required"] > 0]
+        if active:
+            print("\n  Current posture:")
+            for fw in active[:4]:
+                label    = fw_labels.get(fw["framework"], fw["framework"])
+                pct      = fw["score_pct"]
+                attested = fw.get("controls_covered_attested", fw["controls_covered"])
+                inferred = fw["controls_covered"] - attested
+                filled   = int(pct / 5)
+                bar      = "\u2588" * filled + "\u2591" * (20 - filled)
+                source   = f"{attested} attested"
+                if inferred > 0:
+                    source += f"  \u00b7  {inferred} inferred"
+                print(f"    {label:<18} {pct:>3}%  {bar}  {source}")
+            overall = readiness.get("overall_pct", 0)
+            print(f"\n    Overall: {overall}%")
+
+    print("\n  Run `mima scan .` to find unattested AI call sites.\n")
+
+
+def _compute_quickest_wins(
+    frameworks_data: list,
+    readiness_data: list,
+    max_wins: int = 3,
+) -> list:
+    """Return top record_types to push, ranked by potential control coverage gain.
+
+    Only considers frameworks that currently have a gap. Returns a list of dicts
+    with keys: record_type, controls (count), frameworks (list of display names).
+    """
+    gap_slugs = {
+        fw["framework"]
+        for fw in readiness_data
+        if fw["controls_required"] > fw["controls_covered"]
+    }
+    if not gap_slugs:
+        return []
+
+    rt_coverage: dict = {}  # record_type → {"controls": int, "frameworks": set}
+    for fw_detail in frameworks_data:
+        slug = fw_detail.get("framework", "")
+        if slug not in gap_slugs:
+            continue
+        for ctrl in fw_detail.get("controls", []):
+            for rt in ctrl.get("evidence_record_types", []):
+                if rt not in rt_coverage:
+                    rt_coverage[rt] = {"controls": 0, "frameworks": set()}
+                rt_coverage[rt]["controls"] += 1
+                rt_coverage[rt]["frameworks"].add(slug)
+
+    fw_labels = {
+        "soc2_type2": "SOC 2",
+        "iso_27001":  "ISO 27001",
+        "iso_42001":  "ISO 42001",
+        "eu_ai_act":  "EU AI Act",
+        "nist_airf":  "NIST AI RMF",
+    }
+    ranked = sorted(rt_coverage.items(), key=lambda x: x[1]["controls"], reverse=True)
+    wins = []
+    for rt, info in ranked[:max_wins]:
+        fw_names = sorted(fw_labels.get(f, f) for f in info["frameworks"])
+        wins.append({"record_type": rt, "controls": info["controls"], "frameworks": fw_names})
+    return wins
 
 
 def _cmd_status(args: List[str]) -> None:
@@ -321,19 +509,25 @@ def _cmd_status(args: List[str]) -> None:
         sys.exit(0)
 
     import os
-    api_key = os.environ.get("MIMA_API_KEY") or config.get_api_key()
+    api_key      = os.environ.get("MIMA_API_KEY")      or config.get_api_key()
     workspace_id = os.environ.get("MIMA_WORKSPACE_ID") or config.get_workspace_id()
-    base_url = os.environ.get("MIMA_BASE_URL") or config.get_base_url()
+    base_url     = os.environ.get("MIMA_BASE_URL")     or config.get_base_url()
 
     if not api_key or not workspace_id:
         print("mima status: not logged in. Run `mima login` first.", file=sys.stderr)
         sys.exit(1)
 
-    import httpx
+    emit_json = "--json" in args
 
-    url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/governance/grc/readiness"
+    import httpx
+    base    = base_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"}
+
     try:
-        resp = httpx.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10.0)
+        resp = httpx.get(
+            f"{base}/api/workspaces/{workspace_id}/governance/grc/readiness",
+            headers=headers, timeout=10.0,
+        )
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         print(f"mima status: API returned {e.response.status_code}.", file=sys.stderr)
@@ -343,15 +537,22 @@ def _cmd_status(args: List[str]) -> None:
         sys.exit(1)
 
     data = resp.json()
-    emit_json = "--json" in args
 
     if emit_json:
         print(json.dumps(data, indent=2))
         return
 
-    # Pretty-print readiness dashboard
-    print("\nCertification Readiness")
-    print("=" * 50)
+    # Frameworks detail for quickest-wins — best-effort, don't fail status on error.
+    frameworks_data: list = []
+    try:
+        fw_resp = httpx.get(
+            f"{base}/api/workspaces/{workspace_id}/governance/grc/frameworks",
+            headers=headers, timeout=10.0,
+        )
+        if fw_resp.status_code == 200:
+            frameworks_data = fw_resp.json().get("frameworks", [])
+    except Exception:
+        pass
 
     fw_labels = {
         "soc2_type2": "SOC 2 Type II",
@@ -361,28 +562,69 @@ def _cmd_status(args: List[str]) -> None:
         "nist_airf":  "NIST AI RMF",
     }
 
+    short_id = workspace_id[:8] + "…" if len(workspace_id) > 8 else workspace_id
+    print(f"\n  Certification Readiness  ·  workspace: {short_id}\n")
+
+    has_inferred = False
+    unvalidated_labels: List[str] = []
+
     for fw in data.get("frameworks", []):
-        label = fw_labels.get(fw["framework"], fw["framework"])
-        pct = fw["score_pct"]
-        covered = fw["controls_covered"]
+        label    = fw_labels.get(fw["framework"], fw["framework"])
+        pct      = fw["score_pct"]
         required = fw["controls_required"]
+        attested = fw.get("controls_covered_attested", fw["controls_covered"])
+        inferred = fw["controls_covered"] - attested
 
-        # Progress bar (20 chars wide)
+        if inferred > 0:
+            has_inferred = True
+
         filled = int(pct / 5)
-        bar = "\u2588" * filled + "\u2591" * (20 - filled)
+        bar    = "\u2588" * filled + "\u2591" * (20 - filled)
 
-        validated = fw.get("validated_at")
-        badge = " [validated]" if validated else ""
+        if inferred > 0:
+            source_str = f"{attested} attested  \u00b7  {inferred} inferred"
+        elif attested > 0:
+            source_str = f"{attested} attested"
+        elif required == 0:
+            source_str = "no controls defined"
+        else:
+            source_str = "0 attested"
 
-        print(f"  {label:<18} {pct:>3}%  {bar}  ({covered}/{required} controls){badge}")
+        if fw.get("validated_at"):
+            badge = "  \u2713 validated"
+        elif required > 0:
+            badge = "  \u26a0 not validated"
+            unvalidated_labels.append(label)
+        else:
+            badge = ""
+
+        print(f"  {label:<18} {pct:>3}%  {bar}  {source_str}{badge}")
 
     overall = data.get("overall_pct", 0)
-    print(f"\n  Overall: {overall}% (weakest link)")
+    active_fws = [fw for fw in data.get("frameworks", []) if fw["controls_required"] > 0]
+    weakest = min(active_fws, key=lambda f: f["score_pct"], default=None)
+    weakest_label = fw_labels.get(weakest["framework"], weakest["framework"]) if weakest else ""
+    print(f"\n  Overall: {overall}%  (weakest link: {weakest_label})")
 
-    # Show warning if any unvalidated
-    unvalidated = [f for f in data.get("frameworks", []) if f["controls_required"] > 0 and not f.get("validated_at")]
-    if unvalidated:
-        print(f"\n  Warning: {len(unvalidated)} framework(s) not yet validated — scores are indicative only.")
+    if unvalidated_labels:
+        names = ", ".join(unvalidated_labels)
+        print(f"\n  \u26a0 Not yet validated: {names}")
+        print("    Scores are indicative only — validate via the dashboard before audit use.")
+
+    if has_inferred:
+        print()
+        print("  Inferred controls are covered by Mima\u2019s estate inference (source: estate_auto).")
+        print("  They satisfy the awareness gate but not external certification.")
+        print("  Replace with SDK calls to upgrade to certified attestation.")
+
+    # ── Quickest wins ─────────────────────────────────────────────────────────
+    if frameworks_data:
+        wins = _compute_quickest_wins(frameworks_data, data.get("frameworks", []))
+        if wins:
+            print("\n  Quickest wins:")
+            for w in wins:
+                fws = "  ".join(w["frameworks"])
+                print(f"    +{w['controls']:>2} controls  mima push {w['record_type']:<28}  {fws}")
 
     print()
 
@@ -421,27 +663,89 @@ def _cmd_test(args: List[str]) -> None:
         root = Path(args[1])
         import time
         start = time.perf_counter()
-        detections = _scan_path(root)
+        detections, _files_scanned = _scan_path(root)
         duration_ms = (time.perf_counter() - start) * 1000
         result = ScanResult(detections=detections, path=args[1], duration_ms=duration_ms)
-        print(f"\nAttestation Coverage: {result.coverage:.0%}")
-        print(f"  {result.attested} attested / {result.total} total call sites")
-        if result.unattested:
-            print(f"  {result.unattested} unattested (high confidence)")
+        attested_of = f"({result.attested}/{result.attested + result.unattested} attested)"
+        print(f"\n  Attestation Coverage: {result.coverage:.0%}  {attested_of}")
+        unattested_dets = [d for d in detections if not d.attested and d.confidence == "high"]
+        for d in unattested_dets:
+            print(f"  Unattested: {d.file}:{d.line}  [{d.library}]")
         print(f"  Scanned in {duration_ms:.0f}ms")
-        print()
-        sys.exit(0 if result.coverage >= 1.0 else 1)
+        exit_code = 0 if result.coverage >= 1.0 else 1
+        print(f"  \u2192 exit {exit_code}\n")
+        sys.exit(exit_code)
 
     # Run test file
     from .testing import run_test_file, print_suite_result
 
     test_path = args[0]
     suite = run_test_file(test_path)
-    print(f"\nmima test: {test_path}")
-    print("-" * 50)
+    print(f"\n  mima test  \u00b7  {test_path}")
     print_suite_result(suite)
+    exit_code = 0 if suite.all_passed else 1
+    print(f"  \u2192 exit {exit_code}\n")
+    sys.exit(exit_code)
 
-    sys.exit(0 if suite.all_passed else 1)
+
+def _print_push_delta(
+    record_type: str,
+    push_data: dict,
+    before: dict,
+    after: dict,
+) -> None:
+    """Print push result with per-framework readiness score delta."""
+    record_id = push_data.get("record_id", "?")
+    controls  = push_data.get("mapped_controls", [])
+
+    fw_labels = {
+        "soc2_type2": "SOC 2 Type II",
+        "iso_27001":  "ISO 27001:2022",
+        "iso_42001":  "ISO 42001",
+        "eu_ai_act":  "EU AI Act",
+        "nist_airf":  "NIST AI RMF",
+    }
+
+    print(f"\n  {record_type}  \u00b7  record saved")
+    if controls:
+        print(f"  Controls evidenced: {', '.join(controls)}")
+    print(f"  Record ID: {record_id}")
+
+    before_map = {fw["framework"]: fw for fw in before.get("frameworks", [])}
+    after_map  = {fw["framework"]: fw for fw in after.get("frameworks", [])}
+
+    changed = []
+    for slug, fw_after in after_map.items():
+        fw_before = before_map.get(slug)
+        if fw_before and fw_after["score_pct"] != fw_before["score_pct"]:
+            ctrl_delta = fw_after["controls_covered"] - fw_before["controls_covered"]
+            changed.append((slug, fw_before["score_pct"], fw_after["score_pct"], ctrl_delta))
+
+    if changed:
+        print("\n  Readiness change:")
+        for slug, pct_before, pct_after, ctrl_delta in changed:
+            label     = fw_labels.get(slug, slug)
+            delta     = pct_after - pct_before
+            sign      = "+" if delta > 0 else ""
+            ctrl_note = (
+                f"  (+{ctrl_delta} control{'s' if ctrl_delta != 1 else ''})"
+                if ctrl_delta > 0 else ""
+            )
+            print(f"    {label:<18}  {pct_before}% \u2192 {pct_after}%  ({sign}{delta}%){ctrl_note}")
+        overall_before = before.get("overall_pct", 0)
+        overall_after  = after.get("overall_pct", 0)
+        if overall_after != overall_before:
+            d = overall_after - overall_before
+            print(
+                f"\n    Overall: {overall_before}% \u2192 {overall_after}%"
+                f"  ({'+' if d > 0 else ''}{d}%)"
+            )
+    else:
+        overall = after.get("overall_pct", 0)
+        print(f"\n  No score change yet  \u00b7  Overall: {overall}%")
+        print("  Push more records to evidence additional controls.")
+
+    print()
 
 
 def _cmd_push(args: List[str]) -> None:
@@ -522,9 +826,10 @@ def _cmd_push(args: List[str]) -> None:
         print("mima push: not logged in. Run `mima login` first.", file=sys.stderr)
         sys.exit(1)
 
-    emit_json = "--json" in args
-    use_stdin = "--stdin" in args
-    clean_args = [a for a in args if a not in ("--json", "--stdin")]
+    emit_json  = "--json" in args
+    use_stdin  = "--stdin" in args
+    show_delta = not emit_json and "--no-delta" not in args
+    clean_args = [a for a in args if a not in ("--json", "--stdin", "--no-delta")]
 
     # ── stdin JSON mode ──────────────────────────────────────────────────────
     if use_stdin:
@@ -588,15 +893,30 @@ def _cmd_push(args: List[str]) -> None:
 
     payload.setdefault("system_name", system_name)
 
-    # ── HTTP push ────────────────────────────────────────────────────────────
     import httpx
 
+    _readiness_url = (
+        f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/governance/grc/readiness"
+    )
+    _auth_headers = {"Authorization": f"Bearer {api_key}"}
+
+    # ── Snapshot before push (for delta display) ─────────────────────────────
+    readiness_before: "dict | None" = None
+    if show_delta:
+        try:
+            snap = httpx.get(_readiness_url, headers=_auth_headers, timeout=10.0)
+            if snap.status_code == 200:
+                readiness_before = snap.json()
+        except Exception:
+            pass
+
+    # ── HTTP push ────────────────────────────────────────────────────────────
     url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/governance/grc/evidence"
     try:
         resp = httpx.post(
             url,
             json=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_auth_headers,
             timeout=15.0,
         )
         resp.raise_for_status()
@@ -612,12 +932,33 @@ def _cmd_push(args: List[str]) -> None:
 
     if emit_json:
         print(json.dumps(data, indent=2))
+    elif show_delta:
+        # Snapshot after push and display delta
+        readiness_after: "dict | None" = None
+        try:
+            after_snap = httpx.get(_readiness_url, headers=_auth_headers, timeout=10.0)
+            if after_snap.status_code == 200:
+                readiness_after = after_snap.json()
+        except Exception:
+            pass
+
+        if readiness_before is not None and readiness_after is not None:
+            _print_push_delta(record_type, data, readiness_before, readiness_after)
+        else:
+            # Delta fetch failed — graceful fallback
+            record_id = data.get("record_id", "?")
+            controls  = data.get("mapped_controls", [])
+            print(f"\n  {record_type}  \u00b7  record saved")
+            if controls:
+                print(f"  Controls evidenced: {', '.join(controls)}")
+            print(f"  Record ID: {record_id}\n")
     else:
         record_id = data.get("record_id", "?")
         controls  = data.get("mapped_controls", [])
-        print(f"Pushed {record_type}")
-        print(f"  record_id:       {record_id}")
-        print(f"  mapped_controls: {', '.join(controls) or '(none)'}")
+        print(f"\n  {record_type}  \u00b7  record saved")
+        if controls:
+            print(f"  Controls evidenced: {', '.join(controls)}")
+        print(f"  Record ID: {record_id}\n")
 
 
 def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
@@ -891,8 +1232,145 @@ def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
     return None
 
 
+_INIT_TEST_TEMPLATE = '''\
+"""Governance policy tests — generated by `mima init`.
+
+Edit SCAN_PATH to narrow the scan (e.g. "src/" instead of ".").
+Run:  mima test {output_path}
+"""
+from mima_governance.testing import GovernanceTest, assert_attested
+
+SCAN_PATH = {scan_path_repr}  # folder scanned; edit to narrow scope
+
+
+class TestAttestation(GovernanceTest):
+    """Assert AI call sites in SCAN_PATH are covered by @mima.attest().{detected_comment}
+    """
+
+    def test_all_calls_attested(self):
+        """Fail if any unattested high-confidence AI call sites exist."""
+        result = self.scan(SCAN_PATH)
+        return assert_attested(result, min_coverage=1.0)
+
+    def test_coverage_threshold(self):
+        """Soft gate — passes at 80%. Raise min_coverage to tighten."""
+        result = self.scan(SCAN_PATH)
+        return assert_attested(result, min_coverage=0.8)
+'''
+
+
+def _cmd_init(args: List[str]) -> None:
+    """Handle `mima init [path] [--output FILE] [--force]`."""
+    if args and args[0] in ("-h", "--help"):
+        print(textwrap.dedent("""\
+            mima init — generate a governance test file from your codebase
+
+            Usage:
+                mima init [path] [--output FILE] [--force]
+
+            Arguments:
+                path              Codebase path to scan (default: .)
+                --output FILE     Where to write the test file
+                                  (default: tests/test_governance.py)
+                --force           Overwrite existing output file
+
+            What it does:
+                Scans your code for AI library call sites, then generates a
+                GovernanceTest file with assertions you can run immediately
+                and commit to CI/CD.
+
+            After running:
+                mima test tests/test_governance.py   # run the generated tests
+                mima login                           # connect to compliance dashboard
+        """))
+        sys.exit(0)
+
+    force     = "--force" in args
+    output    = "tests/test_governance.py"
+    scan_path = "."
+    clean     = [a for a in args if a != "--force"]
+
+    i = 0
+    while i < len(clean):
+        if clean[i] == "--output" and i + 1 < len(clean):
+            output = clean[i + 1]
+            i += 2
+        elif not clean[i].startswith("--"):
+            scan_path = clean[i]
+            i += 1
+        else:
+            i += 1
+
+    out_path = Path(output)
+    if out_path.exists() and not force:
+        print(
+            f"mima init: {output} already exists. Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"\n  Scanning {scan_path} for AI call sites...", end=" ", flush=True)
+    import time
+    t0 = time.perf_counter()
+    detections, files_scanned = _scan_path(Path(scan_path))
+    duration_ms = (time.perf_counter() - t0) * 1000
+
+    high_conf  = [d for d in detections if d.confidence == "high"]
+    unattested = [d for d in high_conf if not d.attested]
+    libs       = sorted({d.library for d in high_conf})
+
+    if high_conf:
+        n_calls = len(high_conf)
+        n_files = len({d.file for d in high_conf})
+        print(
+            f"{n_calls} call{'s' if n_calls != 1 else ''} across "
+            f"{n_files} file{'s' if n_files != 1 else ''} ({duration_ms:.0f}ms)"
+        )
+    else:
+        print(f"none found in {files_scanned:,} files ({duration_ms:.0f}ms)")
+
+    # Build the comment block embedded in the class docstring
+    if libs:
+        coverage_now = (
+            int((len(high_conf) - len(unattested)) / len(high_conf) * 100)
+            if high_conf else 100
+        )
+        libs_str = ", ".join(libs)
+        detected_comment = (
+            f"\n\n    mima init detected: {libs_str}"
+            f"\n    {len(unattested)} unattested  \u00b7  {coverage_now}% coverage now"
+            f"\n    Run `mima scan {scan_path}` to see the full list."
+        )
+    else:
+        detected_comment = (
+            "\n\n    mima init found no AI library calls — tests will pass immediately."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    content = _INIT_TEST_TEMPLATE.format(
+        output_path=output,
+        scan_path_repr=repr(scan_path),
+        detected_comment=detected_comment,
+    )
+    out_path.write_text(content)
+
+    print(f"  Writing {output}")
+    print(f"    TestAttestation.test_all_calls_attested"
+          f"   \u2014 assert 0 unattested")
+    print(f"    TestAttestation.test_coverage_threshold"
+          f"   \u2014 assert \u226580% attested")
+    print(f"\n  Run:    mima test {output}")
+    print(f"\n  Add to CI/CD (.github/workflows/governance.yml):")
+    print(f"    - name: Governance check")
+    print(f"      run: |")
+    print(f"        pip install mima-governance")
+    print(f"        mima test {output}")
+    print(f"\n  Next: `mima login` to connect results to your compliance dashboard.\n")
+
+
 _COMMANDS = {
     "scan":   _cmd_scan,
+    "init":   _cmd_init,
     "login":  _cmd_login,
     "status": _cmd_status,
     "test":   _cmd_test,
@@ -909,6 +1387,7 @@ def main() -> None:
             mima — AI governance CLI
 
             Commands:
+                mima init [path]          Generate a governance test file from your codebase
                 mima scan <path>          Detect unattested AI call sites
                 mima test <file>          Run governance policy assertions
                 mima status               Show certification readiness scores
@@ -917,10 +1396,13 @@ def main() -> None:
 
             Run `mima <command> --help` for command-specific options.
 
-            Quick start:
+            Quick start (no account needed):
+                mima init .                             # generate tests/test_governance.py
+                mima test tests/test_governance.py      # run policy tests immediately
+
+            With a Mima account:
                 mima login                              # store API credentials
                 mima scan .                             # find unattested AI calls
-                mima test tests/test_governance.py      # run policy tests
                 mima status                             # check readiness scores
                 mima push change_event --by ci \\       # push evidence from CI/CD
                     --description "Deploy v1.2" \\

@@ -66,6 +66,7 @@ class TestResult:
     passed: bool
     message: str = ""
     duration_ms: float = 0.0
+    class_name: str = ""  # set by run_test_file; empty for direct use
 
 
 @dataclass
@@ -140,7 +141,7 @@ class GovernanceTest:
         """Scan a path for AI call sites. Returns a ScanResult."""
         root = Path(path)
         start = time.perf_counter()
-        detections = _scan_path(root, include)
+        detections, _files_scanned = _scan_path(root, include)
         duration_ms = (time.perf_counter() - start) * 1000
         return ScanResult(detections=detections, path=path, duration_ms=duration_ms)
 
@@ -209,20 +210,44 @@ def run_test_file(path: str) -> TestSuiteResult:
         ):
             instance = obj()
             class_suite = instance.run_all()
+            for result in class_suite.results:
+                result.class_name = name
             suite.results.extend(class_suite.results)
 
     return suite
 
 
 def print_suite_result(suite: TestSuiteResult) -> None:
-    """Pretty-print test suite results to stdout."""
-    for r in suite.results:
-        symbol = "\u2713" if r.passed else "\u2717"
-        time_str = f"({r.duration_ms:.0f}ms)" if r.duration_ms else ""
-        print(f"  {symbol} {r.name} {time_str}")
-        if not r.passed and r.message:
-            print(f"    {r.message}")
+    """Pretty-print test suite results in DeepEval-style grouped layout."""
+    from collections import OrderedDict
 
-    print()
-    total = len(suite.results)
-    print(f"{suite.failed} failed, {suite.passed} passed ({total} total)")
+    # Group results by class_name, preserving insertion order.
+    groups: "OrderedDict[str, list]" = OrderedDict()
+    for r in suite.results:
+        key = r.class_name or ""
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(r)
+
+    for class_name, results in groups.items():
+        if class_name:
+            print(f"\n  {class_name}")
+
+        for r in results:
+            symbol   = "\u2713" if r.passed else "\u2717"
+            timing   = f"{r.duration_ms:.0f}ms" if r.duration_ms else ""
+            # Column layout: name (32), timing (8), inline note
+            name_col = r.name.ljust(32)
+            time_col = timing.ljust(8)
+            note     = r.message if r.passed else "FAILED"
+            print(f"    {symbol} {name_col}  {time_col}  {note}")
+
+            if not r.passed and r.message:
+                print()
+                for line in r.message.split("\n"):
+                    print(f"        {line}")
+                print()
+
+    total_ms = sum(r.duration_ms for r in suite.results)
+    ms_str   = f"{total_ms:.0f}ms"
+    print(f"\n  {suite.passed} passed  {suite.failed} failed  in {ms_str}")

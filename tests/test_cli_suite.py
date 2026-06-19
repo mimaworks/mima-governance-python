@@ -19,6 +19,7 @@ class TestMainDispatch:
             assert exc.value.code == 0
         out = capsys.readouterr().out
         assert "mima scan" in out
+        assert "mima init" in out
         assert "mima test" in out
         assert "mima status" in out
         assert "mima login" in out
@@ -57,7 +58,7 @@ class TestCmdScan:
             from mima_governance.cli import main
             main()
         out = capsys.readouterr().out
-        assert "no AI library call sites found" in out
+        assert "No AI library call sites found" in out
 
     def test_scan_detects_openai(self, tmp_path, capsys):
         test_file = tmp_path / "app.py"
@@ -80,6 +81,76 @@ class TestCmdScan:
         assert isinstance(data, list)
         assert len(data) >= 1
         assert data[0]["library"] == "anthropic"
+
+
+class TestCmdInit:
+    """Test mima init subcommand."""
+
+    def test_init_help(self, capsys):
+        with patch("sys.argv", ["mima", "init", "--help"]):
+            with pytest.raises(SystemExit) as exc:
+                from mima_governance.cli import main
+                main()
+            assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "test_governance.py" in out
+        assert "--output" in out
+
+    def test_init_generates_file(self, tmp_path, capsys):
+        out_file = tmp_path / "tests" / "test_gov.py"
+        with patch("sys.argv", ["mima", "init", str(tmp_path),
+                                 "--output", str(out_file)]):
+            from mima_governance.cli import main
+            main()
+        assert out_file.exists()
+        content = out_file.read_text()
+        assert "GovernanceTest" in content
+        assert "test_all_calls_attested" in content
+        assert "test_coverage_threshold" in content
+
+    def test_init_detects_openai(self, tmp_path, capsys):
+        (tmp_path / "agent.py").write_text(
+            "import openai\nopenai.chat.completions.create()\n"
+        )
+        out_file = tmp_path / "test_gov.py"
+        with patch("sys.argv", ["mima", "init", str(tmp_path),
+                                 "--output", str(out_file)]):
+            from mima_governance.cli import main
+            main()
+        content = out_file.read_text()
+        assert "openai" in content
+        out = capsys.readouterr().out
+        assert "1 call" in out
+
+    def test_init_refuses_overwrite_without_force(self, tmp_path):
+        out_file = tmp_path / "test_gov.py"
+        out_file.write_text("# existing\n")
+        with patch("sys.argv", ["mima", "init", str(tmp_path),
+                                 "--output", str(out_file)]):
+            with pytest.raises(SystemExit) as exc:
+                from mima_governance.cli import main
+                main()
+            assert exc.value.code == 1
+
+    def test_init_force_overwrites(self, tmp_path):
+        out_file = tmp_path / "test_gov.py"
+        out_file.write_text("# existing\n")
+        with patch("sys.argv", ["mima", "init", str(tmp_path),
+                                 "--output", str(out_file), "--force"]):
+            from mima_governance.cli import main
+            main()
+        content = out_file.read_text()
+        assert "GovernanceTest" in content
+
+    def test_init_ci_snippet_in_output(self, tmp_path, capsys):
+        out_file = tmp_path / "test_gov.py"
+        with patch("sys.argv", ["mima", "init", str(tmp_path),
+                                 "--output", str(out_file)]):
+            from mima_governance.cli import main
+            main()
+        out = capsys.readouterr().out
+        assert "pip install mima-governance" in out
+        assert "mima login" in out
 
 
 class TestCmdLogin:
@@ -112,7 +183,8 @@ class TestCmdLogin:
 
         mock_save.assert_called_once_with("mima_ext_test123", "ws-abc", "http://localhost:8081")
         out = capsys.readouterr().out
-        assert "Authenticated" in out
+        assert "Verifying credentials" in out
+        assert "ws-abc" in out
 
     @patch("httpx.get")
     def test_login_invalid_key(self, mock_get, capsys):
@@ -179,7 +251,7 @@ class TestCmdStatus:
         assert "68%" in out
         assert "54%" in out
         assert "Overall: 54%" in out
-        assert "[validated]" in out
+        assert "\u2713 validated" in out
 
     @patch("httpx.get")
     def test_status_json_output(self, mock_get, capsys, monkeypatch):
