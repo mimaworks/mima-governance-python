@@ -24,8 +24,13 @@ _AI_LIBRARY_NAMES = frozenset(
     ["openai", "anthropic", "langchain", "llama_index", "autogen", "crewai", "litellm"]
 )
 
-# Decorator names that indicate a call site is attested.
-_ATTEST_DECORATORS = frozenset(["mima", "client"])
+# Exact decorator names (without a dot suffix) that indicate attestation.
+# "client" was intentionally removed — it is far too common (@client.get in Flask,
+# @client.event in Discord bots, etc.) and caused false negatives where real
+# unattested AI calls hid behind framework decorators.
+# The .attest suffix check below (Pattern 2) covers @anything.attest without
+# needing to enumerate variable names.
+_ATTEST_EXACT_NAMES = frozenset(["mima", "mima_client", "mima_governance"])
 
 
 class Detection(NamedTuple):
@@ -38,30 +43,45 @@ class Detection(NamedTuple):
 
 def _scan_file(path: Path) -> Iterator[Detection]:
     """Yield detections for a single Python source file."""
-    try:
-        tokens = list(tokenize.open(str(path)).read())
-    except (OSError, UnicodeDecodeError):
-        return
-
-    # Re-tokenize properly.
+    # Single tokenize pass — no dead pre-read, no leaked file handle.
     try:
         with tokenize.open(str(path)) as fh:
             raw_tokens = list(tokenize.generate_tokens(fh.readline))
-    except tokenize.TokenError:
+    except (OSError, UnicodeDecodeError, tokenize.TokenError):
         return
 
-    # Build a list of decorator names seen before each function/class definition.
-    # We record line numbers of @mima / @client.attest decorators.
+    # Build a set of line numbers where a Mima attest decorator appears.
+    # Two recognition patterns:
+    #   Pattern 1 — exact variable name:  @mima, @mima_client, @mima_governance
+    #   Pattern 2 — .attest suffix:       @anything.attest(...)
+    # Pattern 2 covers @client.attest, @gov.attest etc. without broad false
+    # negatives from common names like @client (Flask, Discord, websockets).
+    _skip = frozenset([
+        tokenize.NL, tokenize.NEWLINE, tokenize.INDENT,
+        tokenize.DEDENT, tokenize.COMMENT,
+    ])
+
+    def _meaningful_after(start: int, n: int = 6) -> List:
+        return [t for t in raw_tokens[start:start + n] if t.type not in _skip]
+
     decorator_lines: set[int] = set()
     for i, tok in enumerate(raw_tokens):
-        if tok.type == tokenize.OP and tok.string == "@":
-            # Look at the next NAME token.
-            for j in range(i + 1, min(i + 4, len(raw_tokens))):
-                if raw_tokens[j].type == tokenize.NAME:
-                    if raw_tokens[j].string in _ATTEST_DECORATORS:
-                        # Record lines from decorator to the next def/class (approx ±5 lines).
-                        decorator_lines.add(tok.start[0])
-                    break
+        if tok.type != tokenize.OP or tok.string != "@":
+            continue
+        following = _meaningful_after(i + 1)
+        if not following or following[0].type != tokenize.NAME:
+            continue
+        first_name = following[0]
+        # Pattern 1: exact known name
+        if first_name.string in _ATTEST_EXACT_NAMES:
+            decorator_lines.add(tok.start[0])
+        # Pattern 2: name.attest — the `.attest` suffix is specific enough
+        elif (
+            len(following) >= 3
+            and following[1].type == tokenize.OP and following[1].string == "."
+            and following[2].type == tokenize.NAME and following[2].string == "attest"
+        ):
+            decorator_lines.add(tok.start[0])
 
     # Walk tokens looking for AI library name followed by ".".
     for i, tok in enumerate(raw_tokens):
@@ -236,10 +256,13 @@ def _cmd_login(args: List[str]) -> None:
         else:
             i += 1
 
-    # Interactive mode if flags not provided
+    # Interactive mode if flags not provided.
+    # Use getpass for API key — keeps it out of terminal recordings and
+    # prevents shoulder-surfing exposure.
+    import getpass
     if not api_key:
         try:
-            api_key = input("API key: ").strip()
+            api_key = getpass.getpass("API key: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nAborted.")
             sys.exit(1)
@@ -334,6 +357,8 @@ def _cmd_status(args: List[str]) -> None:
         "soc2_type2": "SOC 2 Type II",
         "iso_27001":  "ISO 27001:2022",
         "iso_42001":  "ISO 42001",
+        "eu_ai_act":  "EU AI Act",
+        "nist_airf":  "NIST AI RMF",
     }
 
     for fw in data.get("frameworks", []):
@@ -451,7 +476,35 @@ def _cmd_push(args: List[str]) -> None:
 
         incident_report  --title TEXT --severity critical|high|medium|low
                          --description TEXT --affected-systems SYS1,SYS2
-                         [--detected-at ISO8601]
+                         [--detected-at ISO8601] [--authority-notified-at ISO8601]
+
+        ai_risk_assessment  --system NAME --risk-tier unacceptable|high|limited|minimal
+                            --use-case TEXT --impact-domains DOM1,DOM2
+                            --art5-self-assessment true|false --assessor EMAIL
+                            [--assessment-date ISO8601] [--technical-doc-url URL]
+
+        training_data_governance  --model-id ID --dataset-id ID --record-count N
+                                  --bias-checks-performed true|false --approved-by EMAIL
+                                  --data-sources SRC1,SRC2 --data-categories CAT1,CAT2
+                                  [--approval-date ISO8601] [--known-limitations TEXT]
+
+        model_evaluation  --model-id ID --dataset ID --accuracy FLOAT
+                          --evaluated-by EMAIL
+                          [--evaluation-type initial|quarterly|triggered]
+                          [--passed-threshold true|false] [--evaluation-date ISO8601]
+
+        human_oversight   --decision-id ID --ai-recommendation TEXT
+                          --human-decision TEXT --reviewer EMAIL
+                          [--rationale TEXT] [--model-id ID]
+
+        model_drift_event  --model-id ID --metric NAME --baseline FLOAT
+                           --current FLOAT --threshold FLOAT --detected-by EMAIL
+                           [--drift-type performance|data|concept]
+                           [--action-taken TEXT] [--detection-date ISO8601]
+
+        governance_review  --reviewed-by IDENTITY --report-type TYPE
+                           --frameworks FW1,FW2 --overall-readiness 0-100
+                           [--action-items N] [--review-date ISO8601]
     """
     if not args or args[0] in ("-h", "--help"):
         print(textwrap.dedent(_cmd_push.__doc__ or ""))
@@ -493,8 +546,12 @@ def _cmd_push(args: List[str]) -> None:
             sys.exit(1)
 
         record_type = clean_args[0]
-        valid_types = ("access_review", "change_event", "vendor_risk",
-                       "policy_acknowledged", "incident_report")
+        valid_types = (
+            "access_review", "change_event", "vendor_risk",
+            "policy_acknowledged", "incident_report",
+            "ai_risk_assessment", "training_data_governance", "model_evaluation",
+            "human_oversight", "model_drift_event", "governance_review",
+        )
         if record_type not in valid_types:
             print(
                 f"mima push: unknown record_type '{record_type}'.\n"
@@ -504,11 +561,21 @@ def _cmd_push(args: List[str]) -> None:
             sys.exit(1)
 
         # Parse --key value flags from remaining args.
+        # Detect trailing flags (no value) and error immediately rather than
+        # silently dropping them — a flag at end-of-args or followed by another
+        # flag is almost certainly a typo.
         flags: dict = {}
         i = 1
         while i < len(clean_args):
-            if clean_args[i].startswith("--") and i + 1 < len(clean_args):
-                key = clean_args[i][2:].replace("-", "_")  # --reviewed-by → reviewed_by
+            arg = clean_args[i]
+            if arg.startswith("--"):
+                key = arg[2:].replace("-", "_")  # --reviewed-by → reviewed_by
+                if i + 1 >= len(clean_args) or clean_args[i + 1].startswith("--"):
+                    print(
+                        f"mima push: flag {arg} requires a value but none was provided.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
                 flags[key] = clean_args[i + 1]
                 i += 2
             else:
@@ -648,16 +715,177 @@ def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
                   file=sys.stderr)
             return None
         systems = [s.strip() for s in flags["affected_systems"].split(",") if s.strip()]
-        p: dict = {
-            "payload": {
-                "title":            flags["title"],
-                "severity":         flags["severity"],
-                "description":      flags["description"],
-                "affected_systems": systems,
-            },
+        incident_payload: dict = {
+            "title":            flags["title"],
+            "severity":         flags["severity"],
+            "description":      flags["description"],
+            "affected_systems": systems,
         }
+        if flags.get("authority_notified_at"):
+            incident_payload["authority_notified_at"] = flags["authority_notified_at"]
+        p: dict = {"payload": incident_payload}
         if flags.get("detected_at"):
             p["occurred_at"] = flags["detected_at"]
+        return p
+
+    if record_type == "ai_risk_assessment":
+        if not require("system", "risk_tier", "use_case", "impact_domains",
+                       "art5_self_assessment", "assessor"):
+            return None
+        valid_tiers = ("unacceptable", "high", "limited", "minimal")
+        if flags["risk_tier"] not in valid_tiers:
+            print(f"mima push: --risk-tier must be one of: {', '.join(valid_tiers)}",
+                  file=sys.stderr)
+            return None
+        a5_raw = flags["art5_self_assessment"].lower()
+        if a5_raw not in ("true", "false", "1", "0", "yes", "no"):
+            print("mima push: --art5-self-assessment must be true or false", file=sys.stderr)
+            return None
+        domains = [d.strip() for d in flags["impact_domains"].split(",") if d.strip()]
+        ai_payload: dict = {
+            "system_name":          flags["system"],
+            "risk_tier":            flags["risk_tier"],
+            "use_case":             flags["use_case"],
+            "impact_domains":       domains,
+            "art5_self_assessment": a5_raw in ("true", "1", "yes"),
+            "assessor":             flags["assessor"],
+        }
+        if flags.get("technical_doc_url"):
+            ai_payload["technical_doc_url"] = flags["technical_doc_url"]
+        p = {"payload": ai_payload, "resource": flags["system"]}
+        if flags.get("assessment_date"):
+            p["occurred_at"] = flags["assessment_date"]
+        return p
+
+    if record_type == "training_data_governance":
+        if not require("model_id", "dataset_id", "record_count",
+                       "bias_checks_performed", "approved_by",
+                       "data_sources", "data_categories"):
+            return None
+        bc_raw = flags["bias_checks_performed"].lower()
+        if bc_raw not in ("true", "false", "1", "0", "yes", "no"):
+            print("mima push: --bias-checks-performed must be true or false", file=sys.stderr)
+            return None
+        sources = [s.strip() for s in flags["data_sources"].split(",") if s.strip()]
+        categories = [c.strip() for c in flags["data_categories"].split(",") if c.strip()]
+        tdg_payload: dict = {
+            "model_id":              flags["model_id"],
+            "dataset_id":            flags["dataset_id"],
+            "record_count":          int(flags["record_count"]),
+            "bias_checks_performed": bc_raw in ("true", "1", "yes"),
+            "approved_by":           flags["approved_by"],
+            "data_sources":          sources,
+            "data_categories":       categories,
+        }
+        if flags.get("known_limitations"):
+            tdg_payload["known_limitations"] = flags["known_limitations"]
+        p = {
+            "payload":  tdg_payload,
+            "resource": flags["dataset_id"],
+            "identity": flags["approved_by"],
+        }
+        if flags.get("approval_date"):
+            p["occurred_at"] = flags["approval_date"]
+        return p
+
+    if record_type == "model_evaluation":
+        if not require("model_id", "dataset", "accuracy", "evaluated_by"):
+            return None
+        valid_eval_types = ("initial", "quarterly", "triggered")
+        eval_type = flags.get("evaluation_type", "quarterly")
+        if eval_type not in valid_eval_types:
+            print(f"mima push: --evaluation-type must be one of: {', '.join(valid_eval_types)}",
+                  file=sys.stderr)
+            return None
+        me_payload: dict = {
+            "model_id":        flags["model_id"],
+            "dataset":         flags["dataset"],
+            "accuracy":        float(flags["accuracy"]),
+            "evaluated_by":    flags["evaluated_by"],
+            "evaluation_type": eval_type,
+        }
+        if flags.get("passed_threshold") is not None:
+            pt_raw = flags["passed_threshold"].lower()
+            me_payload["passed_threshold"] = pt_raw in ("true", "1", "yes")
+        p = {
+            "payload":  me_payload,
+            "resource": flags["model_id"],
+            "identity": flags["evaluated_by"],
+        }
+        if flags.get("evaluation_date"):
+            p["occurred_at"] = flags["evaluation_date"]
+        return p
+
+    if record_type == "human_oversight":
+        if not require("decision_id", "ai_recommendation", "human_decision", "reviewer"):
+            return None
+        ho_payload: dict = {
+            "decision_id":       flags["decision_id"],
+            "ai_recommendation": flags["ai_recommendation"],
+            "human_decision":    flags["human_decision"],
+            "reviewer":          flags["reviewer"],
+            "override":          flags["ai_recommendation"] != flags["human_decision"],
+        }
+        if flags.get("rationale"):
+            ho_payload["rationale"] = flags["rationale"]
+        if flags.get("model_id"):
+            ho_payload["model_id"] = flags["model_id"]
+        return {
+            "payload":  ho_payload,
+            "resource": flags["decision_id"],
+            "identity": flags["reviewer"],
+        }
+
+    if record_type == "model_drift_event":
+        if not require("model_id", "metric", "baseline", "current",
+                       "threshold", "detected_by"):
+            return None
+        valid_drift_types = ("performance", "data", "concept")
+        drift_type = flags.get("drift_type", "performance")
+        if drift_type not in valid_drift_types:
+            print(f"mima push: --drift-type must be one of: {', '.join(valid_drift_types)}",
+                  file=sys.stderr)
+            return None
+        mde_payload: dict = {
+            "model_id":    flags["model_id"],
+            "metric":      flags["metric"],
+            "baseline":    float(flags["baseline"]),
+            "current":     float(flags["current"]),
+            "threshold":   float(flags["threshold"]),
+            "drift_type":  drift_type,
+            "detected_by": flags["detected_by"],
+        }
+        if flags.get("action_taken"):
+            mde_payload["action_taken"] = flags["action_taken"]
+        p = {
+            "payload":  mde_payload,
+            "resource": flags["model_id"],
+            "identity": flags["detected_by"],
+        }
+        if flags.get("detection_date"):
+            p["occurred_at"] = flags["detection_date"]
+        return p
+
+    if record_type == "governance_review":
+        if not require("reviewed_by", "report_type", "frameworks", "overall_readiness"):
+            return None
+        readiness = int(flags["overall_readiness"])
+        if not (0 <= readiness <= 100):
+            print("mima push: --overall-readiness must be 0–100", file=sys.stderr)
+            return None
+        fws = [f.strip() for f in flags["frameworks"].split(",") if f.strip()]
+        gr_payload: dict = {
+            "reviewed_by":         flags["reviewed_by"],
+            "report_type":         flags["report_type"],
+            "frameworks_reviewed": fws,
+            "overall_readiness":   readiness,
+            "action_items":        int(flags.get("action_items", "0")),
+        }
+        if flags.get("notes"):
+            gr_payload["notes"] = flags["notes"]
+        p = {"payload": gr_payload, "identity": flags["reviewed_by"]}
+        if flags.get("review_date"):
+            p["occurred_at"] = flags["review_date"]
         return p
 
     return None

@@ -265,3 +265,279 @@ class TestGrcMethods:
         record: GrcRecord = mock_push.call_args[0][0]
         assert record.occurred_at is not None
         assert record.occurred_at >= before
+
+    def test_incident_report_authority_notified_at_in_payload(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "incident_report", [], "ok")
+            client.incident_report(
+                "Serious AI incident",
+                "critical",
+                description="Model caused harm",
+                affected_systems=["loan-api"],
+                authority_notified_at="2026-06-19T10:00:00Z",
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.payload["authority_notified_at"] == "2026-06-19T10:00:00Z"
+
+    def test_incident_report_authority_notified_at_omitted_when_not_supplied(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "incident_report", [], "ok")
+            client.incident_report("T", "low", description="d", affected_systems=[])
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert "authority_notified_at" not in record.payload
+
+
+# ── Phase 2: AI-specific record types ─────────────────────────────────────────
+
+
+class TestAiRiskAssessment:
+    def test_valid_call_sends_correct_record_type(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "ai_risk_assessment", [], "ok")
+            client.ai_risk_assessment(
+                "loan-scoring-v2",
+                "high",
+                "credit_scoring",
+                impact_domains=["employment", "credit"],
+                art5_self_assessment=True,
+                assessor="j.smith@co.com",
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.record_type == "ai_risk_assessment"
+        assert record.payload["risk_tier"] == "high"
+        assert record.payload["art5_self_assessment"] is True
+        assert record.payload["impact_domains"] == ["employment", "credit"]
+        assert record.payload["assessor"] == "j.smith@co.com"
+        assert record.resource == "loan-scoring-v2"
+
+    def test_invalid_risk_tier_raises_value_error(self, client):
+        with pytest.raises(ValueError, match="risk_tier"):
+            client.ai_risk_assessment(
+                "sys", "dangerous", "use",
+                impact_domains=[], art5_self_assessment=True, assessor="a",
+            )
+
+    def test_invalid_risk_tier_does_not_call_push(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            with pytest.raises(ValueError):
+                client.ai_risk_assessment(
+                    "sys", "bad", "use",
+                    impact_domains=[], art5_self_assessment=False, assessor="a",
+                )
+            mock_push.assert_not_called()
+
+    def test_all_valid_risk_tiers_accepted(self, client):
+        for tier in ("unacceptable", "high", "limited", "minimal"):
+            with patch.object(client, "_push_grc") as mock_push:
+                mock_push.return_value = GrcResult("id", "ai_risk_assessment", [], "ok")
+                client.ai_risk_assessment(
+                    "sys", tier, "use",
+                    impact_domains=[], art5_self_assessment=True, assessor="a",
+                )
+                assert mock_push.call_args[0][0].payload["risk_tier"] == tier
+
+    def test_optional_fields_included_when_supplied(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "ai_risk_assessment", [], "ok")
+            client.ai_risk_assessment(
+                "sys", "high", "use",
+                impact_domains=[],
+                art5_self_assessment=True,
+                assessor="a",
+                technical_doc_url="https://docs.example.com",
+                notes="Initial classification",
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.payload["technical_doc_url"] == "https://docs.example.com"
+        assert record.payload["notes"] == "Initial classification"
+
+    def test_field_name_is_art5_self_assessment_not_old_name(self, client):
+        import inspect
+        sig = inspect.signature(client.ai_risk_assessment)
+        assert "art5_self_assessment" in sig.parameters
+        assert "prohibited_practices_checked" not in sig.parameters
+
+
+class TestTrainingDataGovernance:
+    def test_valid_call_sends_correct_record_type(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "training_data_governance", [], "ok")
+            client.training_data_governance(
+                "fraud-detector-v2",
+                "credit-bureau-2026-q1",
+                1_500_000,
+                bias_checks_performed=True,
+                approved_by="data-governance@co.com",
+                data_sources=["internal-crm", "credit-bureau"],
+                data_categories=["financial_history"],
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.record_type == "training_data_governance"
+        assert record.payload["bias_checks_performed"] is True
+        assert record.payload["record_count"] == 1_500_000
+        assert record.identity == "data-governance@co.com"
+
+    def test_known_limitations_omitted_when_not_supplied(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "training_data_governance", [], "ok")
+            client.training_data_governance(
+                "m", "d", 100,
+                bias_checks_performed=False,
+                approved_by="a",
+                data_sources=[],
+                data_categories=[],
+            )
+        assert "known_limitations" not in mock_push.call_args[0][0].payload
+
+
+class TestModelEvaluation:
+    def test_valid_call_sends_correct_record_type(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "model_evaluation", [], "ok")
+            client.model_evaluation(
+                "fraud-detector-v2",
+                "holdout-2026-q2",
+                0.94,
+                evaluated_by="ml-ops@co.com",
+                evaluation_type="quarterly",
+                bias_metrics={"demographic_parity": 0.02},
+                passed_threshold=True,
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.record_type == "model_evaluation"
+        assert record.payload["accuracy"] == 0.94
+        assert record.payload["passed_threshold"] is True
+        assert record.payload["bias_metrics"] == {"demographic_parity": 0.02}
+
+    def test_invalid_evaluation_type_raises_value_error(self, client):
+        with pytest.raises(ValueError, match="evaluation_type"):
+            client.model_evaluation("m", "d", 0.9, evaluated_by="a", evaluation_type="annual")
+
+    def test_all_valid_evaluation_types_accepted(self, client):
+        for et in ("initial", "quarterly", "triggered"):
+            with patch.object(client, "_push_grc") as mock_push:
+                mock_push.return_value = GrcResult("id", "model_evaluation", [], "ok")
+                client.model_evaluation("m", "d", 0.9, evaluated_by="a", evaluation_type=et)
+                assert mock_push.call_args[0][0].payload["evaluation_type"] == et
+
+
+class TestHumanOversight:
+    def test_valid_call_sends_correct_record_type(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "human_oversight", [], "ok")
+            client.human_oversight(
+                "loan-decision-9821",
+                "deny",
+                "approve",
+                reviewer="j.smith@co.com",
+                rationale="Income verified independently",
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.record_type == "human_oversight"
+        assert record.payload["override"] is True
+        assert record.payload["rationale"] == "Income verified independently"
+        assert record.identity == "j.smith@co.com"
+
+    def test_override_auto_computed_when_decisions_differ(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "human_oversight", [], "ok")
+            client.human_oversight("d1", "deny", "approve", reviewer="a")
+        assert mock_push.call_args[0][0].payload["override"] is True
+
+    def test_override_false_when_decisions_match(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "human_oversight", [], "ok")
+            client.human_oversight("d2", "approve", "approve", reviewer="a")
+        assert mock_push.call_args[0][0].payload["override"] is False
+
+    def test_explicit_override_takes_precedence(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "human_oversight", [], "ok")
+            client.human_oversight("d3", "approve", "approve", reviewer="a", override=True)
+        assert mock_push.call_args[0][0].payload["override"] is True
+
+
+class TestModelDriftEvent:
+    def test_valid_call_sends_correct_record_type(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "model_drift_event", [], "ok")
+            client.model_drift_event(
+                "fraud-detector-v2",
+                "f1_score",
+                0.92,
+                0.78,
+                0.85,
+                drift_type="performance",
+                detected_by="monitoring-bot",
+                action_taken="retraining_scheduled",
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.record_type == "model_drift_event"
+        assert record.payload["baseline"] == 0.92
+        assert record.payload["current"] == 0.78
+        assert record.payload["action_taken"] == "retraining_scheduled"
+
+    def test_invalid_drift_type_raises_value_error(self, client):
+        with pytest.raises(ValueError, match="drift_type"):
+            client.model_drift_event("m", "f1", 0.9, 0.7, 0.8, drift_type="unknown", detected_by="a")
+
+    def test_all_valid_drift_types_accepted(self, client):
+        for dt in ("performance", "data", "concept"):
+            with patch.object(client, "_push_grc") as mock_push:
+                mock_push.return_value = GrcResult("id", "model_drift_event", [], "ok")
+                client.model_drift_event("m", "f1", 0.9, 0.7, 0.8, drift_type=dt, detected_by="a")
+                assert mock_push.call_args[0][0].payload["drift_type"] == dt
+
+    def test_action_taken_omitted_when_not_supplied(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "model_drift_event", [], "ok")
+            client.model_drift_event("m", "f1", 0.9, 0.7, 0.8, detected_by="a")
+        assert "action_taken" not in mock_push.call_args[0][0].payload
+
+
+class TestGovernanceReview:
+    def test_valid_call_sends_correct_record_type(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            mock_push.return_value = GrcResult("id", "governance_review", [], "ok")
+            client.governance_review(
+                "board-audit-committee",
+                "ai_governance_quarterly",
+                frameworks_reviewed=["soc2_type2", "iso_42001"],
+                overall_readiness=72,
+                action_items=2,
+            )
+        record: GrcRecord = mock_push.call_args[0][0]
+        assert record.record_type == "governance_review"
+        assert record.payload["overall_readiness"] == 72
+        assert record.payload["frameworks_reviewed"] == ["soc2_type2", "iso_42001"]
+        assert record.payload["action_items"] == 2
+        assert record.identity == "board-audit-committee"
+
+    def test_readiness_above_100_raises_value_error(self, client):
+        with pytest.raises(ValueError, match="overall_readiness"):
+            client.governance_review(
+                "reviewer", "quarterly",
+                frameworks_reviewed=[], overall_readiness=101,
+            )
+
+    def test_readiness_below_0_raises_value_error(self, client):
+        with pytest.raises(ValueError, match="overall_readiness"):
+            client.governance_review(
+                "reviewer", "quarterly",
+                frameworks_reviewed=[], overall_readiness=-1,
+            )
+
+    def test_boundary_values_0_and_100_accepted(self, client):
+        for score in (0, 100):
+            with patch.object(client, "_push_grc") as mock_push:
+                mock_push.return_value = GrcResult("id", "governance_review", [], "ok")
+                client.governance_review(
+                    "r", "q", frameworks_reviewed=[], overall_readiness=score,
+                )
+                assert mock_push.call_args[0][0].payload["overall_readiness"] == score
+
+    def test_does_not_call_push_on_invalid_readiness(self, client):
+        with patch.object(client, "_push_grc") as mock_push:
+            with pytest.raises(ValueError):
+                client.governance_review("r", "q", frameworks_reviewed=[], overall_readiness=101)
+            mock_push.assert_not_called()

@@ -1,5 +1,6 @@
 """Mima Governance SDK — core client with decorator, batch, and signing."""
 
+import atexit
 import hashlib
 import json
 import functools
@@ -75,6 +76,11 @@ class MimaGovernance:
         self._batch_queue: List[AttestationRecord] = []
         self._batch_lock = threading.Lock()
         self._batch_timer: Optional[threading.Timer] = None
+
+        # Register flush on interpreter shutdown. atexit is reliable; __del__
+        # is not — Python does not guarantee destructor call order or timing,
+        # so records queued near shutdown can silently vanish with __del__ alone.
+        atexit.register(self._flush_batch)
 
     # ── Decorator: zero-effort attestation ───────────────────────────────────
 
@@ -346,9 +352,22 @@ class MimaGovernance:
             return self._handle_grc_error(f"GRC push error: {e}", record)
 
     def _handle_grc_error(self, message: str, record: GrcRecord) -> GrcResult:
-        """Warn on stderr and return an empty GrcResult. Never raises for GRC errors."""
-        import warnings
-        warnings.warn(f"[mima-governance] {message}", stacklevel=4)
+        """Handle a GRC push failure according to self.on_error.
+
+        Consistent with attestation error handling:
+          "warn"   — emit warnings.warn to stderr, return empty GrcResult
+          "raise"  — raise MimaAttestationError
+          "silent" — return empty GrcResult with no output
+
+        Callers should check ``result.record_id == ''`` to detect failures
+        regardless of on_error mode (except "raise", which never returns).
+        """
+        if self.on_error == "raise":
+            raise MimaAttestationError(f"[mima-governance] {message}")
+        if self.on_error == "warn":
+            import warnings
+            warnings.warn(f"[mima-governance] {message}", stacklevel=4)
+        # "silent": no output
         return GrcResult(
             record_id="",
             record_type=record.record_type,
@@ -554,19 +573,28 @@ class MimaGovernance:
         description: str,
         affected_systems: list,
         detected_at: Optional[str] = None,
+        authority_notified_at: Optional[str] = None,
     ) -> GrcResult:
         """Record a security or AI incident.
 
         Evidences SOC2 CC7.3 / CC7.4 (incident detection and response),
         ISO 27001:2022 5.25 / 5.26 (event assessment and incident response),
-        and ISO 42001 A.3.2 (reporting of AI incidents).
+        ISO 42001 A.3.2 (reporting of AI incidents), EU AI Act Art. 73
+        (serious incident reporting), and SOC2 CC3.3 / CC4.2.
+
+        Note on Art. 73: ``authority_notified_at`` records when a national
+        authority was notified, but the SDK cannot verify notification occurred
+        or enforce the 15-day deadline. Full Art. 73 workflow compliance
+        requires an external notification system.
 
         Args:
-            title:            Short title for the incident.
-            severity:         Must be "critical", "high", "medium", or "low".
-            description:      Full description of what occurred (keyword-only).
-            affected_systems: List of system names affected (keyword-only).
-            detected_at:      ISO 8601 timestamp of detection; defaults to now().
+            title:                 Short title for the incident.
+            severity:              Must be "critical", "high", "medium", or "low".
+            description:           Full description of what occurred (keyword-only).
+            affected_systems:      List of system names affected (keyword-only).
+            detected_at:           ISO 8601 timestamp of detection; defaults to now().
+            authority_notified_at: ISO 8601 timestamp when national authority was
+                                   notified under EU AI Act Art. 73. Optional.
 
         Returns:
             GrcResult. Check ``record_id == ''`` to detect a failed push.
@@ -582,15 +610,428 @@ class MimaGovernance:
 
         occurred = detected_at or datetime.now(timezone.utc).isoformat()
 
+        payload: Dict[str, Any] = {
+            "title":            title,
+            "severity":         severity,
+            "description":      description,
+            "affected_systems": affected_systems,
+        }
+        if authority_notified_at is not None:
+            payload["authority_notified_at"] = authority_notified_at
+
         record = GrcRecord(
             record_type="incident_report",
-            payload={
-                "title":            title,
-                "severity":         severity,
-                "description":      description,
-                "affected_systems": affected_systems,
-            },
+            payload=payload,
             system_name=self.system_name,
+            occurred_at=occurred,
+        )
+        return self._push_grc(record)
+
+    def ai_risk_assessment(
+        self,
+        system_name: str,
+        risk_tier: str,
+        use_case: str,
+        *,
+        impact_domains: list,
+        art5_self_assessment: bool,
+        assessor: str,
+        assessment_date: Optional[str] = None,
+        technical_doc_url: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> GrcResult:
+        """Record an AI system risk classification and assessment.
+
+        Evidences EU AI Act Art. 9 (risk management system), Art. 11
+        (technical documentation), NIST AI RMF GOVERN / MAP, ISO 42001
+        A.6.1 / A.9.1, and SOC2 CC3.1 / CC3.2 / CC5.1.
+
+        Call once per AI system, or whenever the risk classification changes.
+        Not intended for per-inference calls.
+
+        All records are retained as an audit trail of classification changes.
+        The readiness scorer uses the latest record by ``occurred_at`` per system.
+
+        Args:
+            system_name:          Name of the AI system being assessed.
+            risk_tier:            EU AI Act tier — must be "unacceptable",
+                                  "high", "limited", or "minimal".
+            use_case:             Intended use case (e.g. "credit_scoring").
+            impact_domains:       Domains affected — e.g. ["employment",
+                                  "credit", "housing"] (keyword-only).
+            art5_self_assessment: Art. 5 — provider self-declares that no
+                                  prohibited practices apply to this system.
+                                  The SDK cannot detect violations; this is a
+                                  self-assertion (keyword-only).
+            assessor:             Identity who performed the assessment
+                                  (keyword-only).
+            assessment_date:      ISO 8601 date; defaults to now().
+            technical_doc_url:    URL to Art. 11 technical documentation.
+            notes:                Optional free-text notes.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+
+        Raises:
+            ValueError: If ``risk_tier`` is not one of the four valid values.
+        """
+        valid_tiers = ("unacceptable", "high", "limited", "minimal")
+        if risk_tier not in valid_tiers:
+            raise ValueError(
+                f"ai_risk_assessment risk_tier must be one of {valid_tiers}, got '{risk_tier}'"
+            )
+
+        payload: Dict[str, Any] = {
+            "system_name":         system_name,
+            "risk_tier":           risk_tier,
+            "use_case":            use_case,
+            "impact_domains":      impact_domains,
+            "art5_self_assessment": art5_self_assessment,
+            "assessor":            assessor,
+        }
+        if technical_doc_url is not None:
+            payload["technical_doc_url"] = technical_doc_url
+        if notes is not None:
+            payload["notes"] = notes
+
+        occurred = assessment_date or datetime.now(timezone.utc).isoformat()
+
+        record = GrcRecord(
+            record_type="ai_risk_assessment",
+            payload=payload,
+            system_name=self.system_name,
+            resource=system_name,
+            occurred_at=occurred,
+        )
+        return self._push_grc(record)
+
+    def training_data_governance(
+        self,
+        model_id: str,
+        dataset_id: str,
+        record_count: int,
+        *,
+        bias_checks_performed: bool,
+        approved_by: str,
+        data_sources: list,
+        data_categories: list,
+        approval_date: Optional[str] = None,
+        known_limitations: Optional[str] = None,
+    ) -> GrcResult:
+        """Record governance approval for a training dataset.
+
+        Evidences EU AI Act Art. 10 (data and data governance), NIST AI RMF
+        MAP, and ISO 42001 A.5.4 / A.6.5.
+
+        Call when a training dataset is approved for use in a model, not at
+        inference time.
+
+        Args:
+            model_id:              Identifier of the model the dataset trains.
+            dataset_id:            Identifier of the training dataset.
+            record_count:          Number of records in the dataset.
+            bias_checks_performed: Whether bias checks were run (keyword-only).
+            approved_by:           Identity who approved the dataset (keyword-only).
+            data_sources:          Source system identifiers — e.g.
+                                   ["internal-crm", "credit-bureau"] (keyword-only).
+            data_categories:       Data categories present — e.g.
+                                   ["financial_history", "demographic"] (keyword-only).
+            approval_date:         ISO 8601 date; defaults to now().
+            known_limitations:     Optional description of known dataset limitations.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+        """
+        payload: Dict[str, Any] = {
+            "model_id":              model_id,
+            "dataset_id":            dataset_id,
+            "record_count":          record_count,
+            "bias_checks_performed": bias_checks_performed,
+            "approved_by":           approved_by,
+            "data_sources":          data_sources,
+            "data_categories":       data_categories,
+        }
+        if known_limitations is not None:
+            payload["known_limitations"] = known_limitations
+
+        occurred = approval_date or datetime.now(timezone.utc).isoformat()
+
+        record = GrcRecord(
+            record_type="training_data_governance",
+            payload=payload,
+            system_name=self.system_name,
+            resource=dataset_id,
+            identity=approved_by,
+            occurred_at=occurred,
+        )
+        return self._push_grc(record)
+
+    def model_evaluation(
+        self,
+        model_id: str,
+        dataset: str,
+        accuracy: float,
+        *,
+        evaluated_by: str,
+        evaluation_type: str = "quarterly",
+        bias_metrics: Optional[Dict[str, Any]] = None,
+        robustness_score: Optional[float] = None,
+        passed_threshold: Optional[bool] = None,
+        evaluation_date: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> GrcResult:
+        """Record a model evaluation run.
+
+        Evidences EU AI Act Art. 15 (accuracy / robustness), Art. 9 (ongoing
+        risk management), NIST AI RMF MEASURE, ISO 42001 A.6.3 / A.9.2, and
+        SOC2 CC3.2 / CC3.3 / CC4.1 / CC5.1.
+
+        Call after each evaluation run: pre-deployment, periodic, or triggered
+        by drift detection.
+
+        Args:
+            model_id:         Identifier of the model evaluated.
+            dataset:          Identifier of the evaluation dataset used.
+            accuracy:         Accuracy score in range 0.0–1.0.
+            evaluated_by:     Identity who ran the evaluation (keyword-only).
+            evaluation_type:  Must be "initial", "quarterly", or "triggered".
+            bias_metrics:     Dict of bias metric name to value — e.g.
+                              {"demographic_parity": 0.02}.
+            robustness_score: Robustness score in range 0.0–1.0.
+            passed_threshold: Whether the model passed the acceptance threshold.
+            evaluation_date:  ISO 8601 date; defaults to now().
+            notes:            Optional free-text notes.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+
+        Raises:
+            ValueError: If ``evaluation_type`` is not one of the three valid values.
+        """
+        valid_types = ("initial", "quarterly", "triggered")
+        if evaluation_type not in valid_types:
+            raise ValueError(
+                f"model_evaluation evaluation_type must be one of {valid_types}, "
+                f"got '{evaluation_type}'"
+            )
+
+        payload: Dict[str, Any] = {
+            "model_id":        model_id,
+            "dataset":         dataset,
+            "accuracy":        accuracy,
+            "evaluated_by":    evaluated_by,
+            "evaluation_type": evaluation_type,
+        }
+        if bias_metrics is not None:
+            payload["bias_metrics"] = bias_metrics
+        if robustness_score is not None:
+            payload["robustness_score"] = robustness_score
+        if passed_threshold is not None:
+            payload["passed_threshold"] = passed_threshold
+        if notes is not None:
+            payload["notes"] = notes
+
+        occurred = evaluation_date or datetime.now(timezone.utc).isoformat()
+
+        record = GrcRecord(
+            record_type="model_evaluation",
+            payload=payload,
+            system_name=self.system_name,
+            resource=model_id,
+            identity=evaluated_by,
+            occurred_at=occurred,
+        )
+        return self._push_grc(record)
+
+    def human_oversight(
+        self,
+        decision_id: str,
+        ai_recommendation: str,
+        human_decision: str,
+        *,
+        reviewer: str,
+        rationale: Optional[str] = None,
+        model_id: Optional[str] = None,
+        override: Optional[bool] = None,
+    ) -> GrcResult:
+        """Record a human review of an AI decision.
+
+        Evidences EU AI Act Art. 14 (human oversight) and Art. 13
+        (transparency), NIST AI RMF GOVERN, and ISO 42001 A.6.6.
+
+        Call when a human reviews and potentially overrides an AI decision.
+
+        Args:
+            decision_id:       External identifier for the AI decision reviewed.
+            ai_recommendation: The decision or output the AI produced.
+            human_decision:    The decision the human made after review.
+            reviewer:          Identity of the human reviewer (keyword-only).
+            rationale:         Reason for the human decision, if different from AI.
+            model_id:          Identifier of the model that produced the decision.
+            override:          Whether the human overrode the AI. Auto-computed
+                               from differing decisions if omitted.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+        """
+        did_override = override if override is not None else (
+            ai_recommendation != human_decision
+        )
+
+        payload: Dict[str, Any] = {
+            "decision_id":        decision_id,
+            "ai_recommendation":  ai_recommendation,
+            "human_decision":     human_decision,
+            "reviewer":           reviewer,
+            "override":           did_override,
+        }
+        if rationale is not None:
+            payload["rationale"] = rationale
+        if model_id is not None:
+            payload["model_id"] = model_id
+
+        record = GrcRecord(
+            record_type="human_oversight",
+            payload=payload,
+            system_name=self.system_name,
+            resource=decision_id,
+            identity=reviewer,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return self._push_grc(record)
+
+    def model_drift_event(
+        self,
+        model_id: str,
+        metric: str,
+        baseline: float,
+        current: float,
+        threshold: float,
+        *,
+        drift_type: str = "performance",
+        detected_by: str,
+        action_taken: Optional[str] = None,
+        detection_date: Optional[str] = None,
+    ) -> GrcResult:
+        """Record a model drift detection event.
+
+        Evidences EU AI Act Art. 72 (post-market monitoring) and Art. 9,
+        NIST AI RMF MEASURE / MANAGE, ISO 42001 A.6.4, and SOC2 CC4.1 / CC4.2.
+
+        Call when monitoring detects drift beyond a defined threshold.
+
+        Args:
+            model_id:       Identifier of the model that drifted.
+            metric:         Metric that drifted — e.g. "f1_score", "accuracy",
+                            "psi", or a custom metric name.
+            baseline:       Baseline value of the metric at last evaluation.
+            current:        Current observed value of the metric.
+            threshold:      Threshold value that triggered this event.
+            drift_type:     Must be "performance", "data", or "concept".
+            detected_by:    Identity or system that detected the drift
+                            (keyword-only).
+            action_taken:   Action taken in response — e.g.
+                            "retraining_scheduled", "model_paused".
+            detection_date: ISO 8601 date; defaults to now().
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+
+        Raises:
+            ValueError: If ``drift_type`` is not one of the three valid values.
+        """
+        valid_drift_types = ("performance", "data", "concept")
+        if drift_type not in valid_drift_types:
+            raise ValueError(
+                f"model_drift_event drift_type must be one of {valid_drift_types}, "
+                f"got '{drift_type}'"
+            )
+
+        payload: Dict[str, Any] = {
+            "model_id":    model_id,
+            "metric":      metric,
+            "baseline":    baseline,
+            "current":     current,
+            "threshold":   threshold,
+            "drift_type":  drift_type,
+            "detected_by": detected_by,
+        }
+        if action_taken is not None:
+            payload["action_taken"] = action_taken
+
+        occurred = detection_date or datetime.now(timezone.utc).isoformat()
+
+        record = GrcRecord(
+            record_type="model_drift_event",
+            payload=payload,
+            system_name=self.system_name,
+            resource=model_id,
+            identity=detected_by,
+            occurred_at=occurred,
+        )
+        return self._push_grc(record)
+
+    def governance_review(
+        self,
+        reviewed_by: str,
+        report_type: str,
+        *,
+        frameworks_reviewed: list,
+        overall_readiness: int,
+        action_items: int = 0,
+        review_date: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> GrcResult:
+        """Record a governance readiness review by a named identity.
+
+        Evidences SOC2 CC2.1 (quality information supporting internal control)
+        and CC5.2 (board oversight of internal control). Captures when a board
+        member, audit committee, or named reviewer accesses and reviews the
+        Mima governance readiness report.
+
+        Args:
+            reviewed_by:         Identity or role of the reviewer — e.g.
+                                 "board-audit-committee" (keyword-only via
+                                 positional first arg).
+            report_type:         Type of review — e.g. "ai_governance_quarterly",
+                                 "annual_review".
+            frameworks_reviewed: List of framework slugs reviewed — e.g.
+                                 ["soc2_type2", "iso_42001"] (keyword-only).
+            overall_readiness:   Readiness score snapshot at time of review,
+                                 0–100 (keyword-only).
+            action_items:        Number of open action items noted during review.
+            review_date:         ISO 8601 date; defaults to now().
+            notes:               Optional free-text notes from the review.
+
+        Returns:
+            GrcResult. Check ``record_id == ''`` to detect a failed push.
+
+        Raises:
+            ValueError: If ``overall_readiness`` is not in range 0–100.
+        """
+        if not (0 <= overall_readiness <= 100):
+            raise ValueError(
+                f"governance_review overall_readiness must be 0–100, "
+                f"got '{overall_readiness}'"
+            )
+
+        payload: Dict[str, Any] = {
+            "reviewed_by":        reviewed_by,
+            "report_type":        report_type,
+            "frameworks_reviewed": frameworks_reviewed,
+            "overall_readiness":  overall_readiness,
+            "action_items":       action_items,
+        }
+        if notes is not None:
+            payload["notes"] = notes
+
+        occurred = review_date or datetime.now(timezone.utc).isoformat()
+
+        record = GrcRecord(
+            record_type="governance_review",
+            payload=payload,
+            system_name=self.system_name,
+            identity=reviewed_by,
             occurred_at=occurred,
         )
         return self._push_grc(record)
@@ -618,11 +1059,10 @@ class MimaGovernance:
         self._flush_batch()
         self._http.close()
 
-    def __del__(self) -> None:
-        try:
-            self._flush_batch()
-        except Exception:
-            pass
+    # __del__ intentionally removed. atexit.register (in __init__) is the
+    # correct mechanism for interpreter-shutdown flushing — __del__ call order
+    # and timing are undefined, and accessing other objects from __del__ is
+    # unsafe during garbage collection.
 
 
 # ── Trace context ────────────────────────────────────────────────────────────
