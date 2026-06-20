@@ -911,7 +911,19 @@ def _cmd_status(args: List[str]) -> None:
 
 def _cmd_test(args: List[str]) -> None:
     """Handle `mima test <file_or_path>` — run governance policy assertions."""
-    if not args or args[0] in ("-h", "--help"):
+    if not args:
+        # Backward-compat delegation: `mima test` (no args) → `mima policy check`
+        # when a mima_policy/ directory exists in the current working directory.
+        if Path("mima_policy").is_dir():
+            _cmd_policy(["check"])
+        else:
+            print("mima test: specify a test file, or create mima_policy/ for policy-based testing.\n"
+                  "  mima test tests/test_governance.py\n"
+                  "  mima policy init && mima policy check", file=sys.stderr)
+            sys.exit(2)
+        return
+
+    if args[0] in ("-h", "--help"):
         print(textwrap.dedent("""\
             mima test — run governance policy assertions (like DeepEval for compliance)
 
@@ -2059,14 +2071,280 @@ def _cmd_guard(args: List[str]) -> None:
         sys.exit(0)
 
 
+def _cmd_policy(args: List[str]) -> None:
+    """Handle `mima policy check|list|init`."""
+    import os
+
+    if not args or args[0] in ("-h", "--help"):
+        print(textwrap.dedent("""\
+            mima policy — run composable governance policy assertions
+
+            Commands:
+                mima policy check [--path DIR] [--framework SLUG] [--json]
+                    Run all assertions in mima_policy/*.yaml. Exit 1 on any failure.
+
+                mima policy list [--path DIR]
+                    List all policy files and their assertions — no API calls made.
+
+                mima policy init [--frameworks SLUG,SLUG,...] [--path DIR]
+                    Generate starter YAML files. Safe to run again (skips existing).
+
+            Options:
+                --path DIR          Policy directory (default: mima_policy/)
+                --framework SLUG    Filter to one framework (eu_ai_act, soc2_type2, ...)
+                --frameworks LIST   Comma-separated slugs for `init` (default: all)
+                --json              Emit structured JSON to stdout
+
+            Exit codes:
+                0  All assertions pass
+                1  One or more assertions fail
+                2  Policy file not found or parse error
+                3  API unreachable (only for server-side assertions)
+
+            Credentials (for server-side assertions):
+                Set MIMA_API_KEY and MIMA_WORKSPACE_ID, or run `mima login`.
+        """))
+        sys.exit(0)
+
+    subcommand = args[0]
+    rest = args[1:]
+
+    if subcommand == "list":
+        _policy_list(rest)
+    elif subcommand == "check":
+        _policy_check(rest)
+    elif subcommand == "init":
+        _policy_init(rest)
+    else:
+        print(f"mima policy: unknown subcommand '{subcommand}'. "
+              "Use check, list, or init.", file=sys.stderr)
+        sys.exit(2)
+
+
+def _policy_list(args: List[str]) -> None:
+    from .policy import PolicyParseError, _load_yaml, _VALID_ASSERTION_TYPES
+
+    path_str = "mima_policy"
+    i = 0
+    while i < len(args):
+        if args[i] == "--path" and i + 1 < len(args):
+            path_str = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    policy_dir = Path(path_str)
+    if not policy_dir.exists():
+        print(f"mima policy list: directory '{policy_dir}' not found.", file=sys.stderr)
+        sys.exit(2)
+
+    files = sorted(policy_dir.glob("*.yaml")) + sorted(policy_dir.glob("*.yml"))
+    if not files:
+        print(f"  No policy files found in {policy_dir}/")
+        sys.exit(0)
+
+    print(f"\n  mima policy list  ·  {policy_dir}/  ·  {len(files)} file{'s' if len(files) != 1 else ''}\n")
+    for f in files:
+        try:
+            data = _load_yaml(f)
+            print(f"  {data['name']}  [{data['framework']}]  {f.name}")
+            for a in data.get("assertions", []):
+                desc = a.get("description", a.get("type", ""))
+                print(f"    - {a['type']}: {desc}")
+        except PolicyParseError as e:
+            print(f"  {f.name}  [parse error: {e.message}]")
+        print()
+
+
+def _policy_check(args: List[str]) -> None:
+    import os
+    from .policy import PolicyRunner, PolicyParseError
+
+    path_str     = "mima_policy"
+    framework    = None
+    emit_json    = False
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--path" and i + 1 < len(args):
+            path_str = args[i + 1]
+            i += 2
+        elif args[i] == "--framework" and i + 1 < len(args):
+            framework = args[i + 1]
+            i += 2
+        elif args[i] == "--json":
+            emit_json = True
+            i += 1
+        else:
+            i += 1
+
+    policy_dir = Path(path_str)
+    if not policy_dir.exists():
+        print(f"mima policy check: directory '{policy_dir}' not found.", file=sys.stderr)
+        sys.exit(2)
+
+    from . import config as _config
+    api_key      = os.environ.get("MIMA_API_KEY")      or _config.get_api_key()
+    workspace_id = os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = os.environ.get("MIMA_BASE_URL")     or _config.get_base_url()
+
+    runner = PolicyRunner(
+        api_key=api_key,
+        workspace_id=workspace_id,
+        base_url=base_url or "https://api.mima.ai",
+    )
+
+    results = runner.check_dir(policy_dir, framework=framework)
+    if not results:
+        msg = f"No policy files found in {policy_dir}/"
+        if framework:
+            msg += f" for framework '{framework}'"
+        print(f"  {msg}")
+        sys.exit(0)
+
+    if emit_json:
+        import json as _json
+        output = []
+        for pr in results:
+            output.append({
+                "policy_name": pr.policy_name,
+                "framework":   pr.framework,
+                "file_path":   pr.file_path,
+                "passed":      pr.passed,
+                "error":       pr.error,
+                "assertions": [
+                    {
+                        "type":        a.assertion_type,
+                        "description": a.description,
+                        "passed":      a.passed,
+                        "actual":      a.actual,
+                        "expected":    a.expected,
+                        "detail":      a.detail,
+                    }
+                    for a in pr.assertions
+                ],
+            })
+        print(_json.dumps(output, indent=2))
+        failed = any(not r.passed for r in results)
+        sys.exit(1 if failed else 0)
+
+    # API-unreachable detection: any result with error containing "reach"
+    api_unreachable = any(
+        r.error and "reach" in r.error.lower() for r in results
+    )
+
+    files_count = len(results)
+    assertions_count = sum(len(r.assertions) for r in results)
+    print(f"\n  mima policy check  ·  {policy_dir}/  ·  {files_count} file{'s' if files_count != 1 else ''}  ·  {assertions_count} assertion{'s' if assertions_count != 1 else ''}\n")
+
+    total_failed = 0
+    for pr in results:
+        print(f"  {pr.policy_name:<45}  {pr.framework}")
+        if pr.error:
+            print(f"  \u2717  {pr.error}")
+            total_failed += 1
+        else:
+            for a in pr.assertions:
+                mark = "\u2713" if a.passed else "\u2717"
+                label = f"{a.assertion_type}"
+                actual = a.actual
+                status = "pass" if a.passed else "FAIL"
+                line = f"  {mark}  {label:<35}  {actual:<12}  {status}"
+                if a.description:
+                    line += f"  \u2014 {a.description}"
+                print(line)
+                if not a.passed and a.detail:
+                    print(f"       {a.detail}")
+                if not a.passed:
+                    total_failed += 1
+        print()
+
+    if total_failed:
+        print(f"  {total_failed} assertion{'s' if total_failed != 1 else ''} failed  ·  exit 1\n")
+        sys.exit(3 if api_unreachable else 1)
+    else:
+        print(f"  All assertions passed  ·  exit 0\n")
+        sys.exit(0)
+
+
+def _policy_init(args: List[str]) -> None:
+    from .policy import generate_starter_yaml, all_framework_slugs
+
+    path_str   = "mima_policy"
+    frameworks = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--path" and i + 1 < len(args):
+            path_str = args[i + 1]
+            i += 2
+        elif args[i] == "--frameworks" and i + 1 < len(args):
+            frameworks = [f.strip() for f in args[i + 1].split(",")]
+            i += 2
+        else:
+            i += 1
+
+    if frameworks is None:
+        frameworks = all_framework_slugs()
+
+    policy_dir = Path(path_str)
+    policy_dir.mkdir(parents=True, exist_ok=True)
+
+    created = []
+    skipped = []
+
+    for slug in frameworks:
+        content = generate_starter_yaml(slug)
+        if content is None:
+            print(f"  mima policy init: unknown framework '{slug}'. "
+                  f"Known: {', '.join(all_framework_slugs())}", file=sys.stderr)
+            continue
+        out = policy_dir / f"{slug}.yaml"
+        if out.exists():
+            skipped.append(str(out))
+        else:
+            out.write_text(content, encoding="utf-8")
+            created.append(str(out))
+
+    print(f"\n  mima policy init  ·  {policy_dir}/\n")
+    for p in created:
+        print(f"  \u2713  Created  {p}")
+    for p in skipped:
+        print(f"  \u2014  Skipped  {p}  (already exists)")
+    if not created and not skipped:
+        print("  No files written.")
+    print()
+    if created:
+        print(f"  Run `mima policy check` to validate.\n")
+
+
+def _cmd_gates(args: List[str]) -> None:
+    from .gates import run as _gates_run
+    _gates_run(args)
+
+
+def _cmd_webhooks(args: List[str]) -> None:
+    from .webhooks_cmd import run as _webhooks_run
+    _webhooks_run(args)
+
+
+def _cmd_approvals(args: List[str]) -> None:
+    from .approvals_cmd import run as _approvals_run
+    _approvals_run(args)
+
+
 _COMMANDS = {
-    "scan":   _cmd_scan,
-    "init":   _cmd_init,
-    "login":  _cmd_login,
-    "status": _cmd_status,
-    "test":   _cmd_test,
-    "push":   _cmd_push,
-    "guard":  _cmd_guard,
+    "scan":      _cmd_scan,
+    "init":      _cmd_init,
+    "login":     _cmd_login,
+    "status":    _cmd_status,
+    "test":      _cmd_test,
+    "push":      _cmd_push,
+    "guard":     _cmd_guard,
+    "policy":    _cmd_policy,
+    "gates":     _cmd_gates,
+    "webhooks":  _cmd_webhooks,
+    "approvals": _cmd_approvals,
 }
 
 
@@ -2079,13 +2357,17 @@ def main() -> None:
             mima — AI governance CLI
 
             Commands:
-                mima init [path]          Generate a governance test file from your codebase
-                mima scan <path>          Detect unattested AI call sites
-                mima test <file>          Run governance policy assertions
-                mima status               Show certification readiness scores
-                mima login                Authenticate with the Mima API
-                mima push <record_type>   Push a GRC evidence record from CI/CD
-                mima guard start|stop|status   Manage the guard sidecar daemon
+                mima init [path]                Generate a governance test file from your codebase
+                mima scan <path>                Detect unattested AI call sites
+                mima test <file>                Run governance policy assertions
+                mima policy check|list|init     Composable YAML policy assertions (CI gate)
+                mima status                     Show certification readiness scores
+                mima login                      Authenticate with the Mima API
+                mima push <record_type>         Push a GRC evidence record from CI/CD
+                mima guard start|stop|status    Manage the guard sidecar daemon
+                mima gates check|set|unset      Configure and enforce CI governance gates
+                mima webhooks list|register     Manage governance event webhook endpoints
+                mima approvals list|decide      List and action human-approval requests
 
             Run `mima <command> --help` for command-specific options.
 
