@@ -2333,6 +2333,90 @@ def _cmd_approvals(args: List[str]) -> None:
     _approvals_run(args)
 
 
+def _cmd_generate_link(args: List[str]) -> None:
+    """mima generate-link — print a dashboard URL that lands Profile A directly in their workspace.
+
+    Usage:
+        mima generate-link
+        mima generate-link --dashboard https://governance.mima.ai
+        mima generate-link --copy
+    """
+    import textwrap as _tw
+
+    if args and args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima generate-link — generate a shareable dashboard link for a GRC manager
+
+            Usage:
+                mima generate-link [--dashboard URL] [--copy]
+
+            Options:
+                --dashboard URL   Dashboard base URL (default: https://governance.mima.ai)
+                --copy            Copy the link to the clipboard
+
+            The link embeds the workspace ID as a URL parameter (?ws=...) so the
+            recipient lands directly inside the workspace — no UUID entry required.
+
+            Examples:
+                mima generate-link
+                mima generate-link --dashboard https://dashboard.example.com
+                mima generate-link --copy
+        """))
+        return
+
+    import os as _os
+    from . import config as _config
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    if not workspace_id:
+        print("mima generate-link: workspace ID not set — run `mima login` or set MIMA_WORKSPACE_ID.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    dashboard_url = "https://governance.mima.ai"
+    copy = False
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--dashboard" and i + 1 < len(args):
+            dashboard_url = args[i + 1].rstrip("/")
+            i += 2
+        elif args[i] == "--copy":
+            copy = True
+            i += 1
+        else:
+            i += 1
+
+    link = f"{dashboard_url}?ws={workspace_id}"
+    print(f"\n  {link}\n")
+
+    if copy:
+        try:
+            import subprocess
+            # macOS: pbcopy; Linux: xclip/xsel; fallback: pyperclip
+            try:
+                subprocess.run(["pbcopy"], input=link.encode(), check=True)
+                print("  Copied to clipboard.")
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                try:
+                    subprocess.run(
+                        ["xclip", "-selection", "clipboard"],
+                        input=link.encode(), check=True,
+                    )
+                    print("  Copied to clipboard.")
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    try:
+                        import pyperclip
+                        pyperclip.copy(link)
+                        print("  Copied to clipboard.")
+                    except Exception:
+                        print("  --copy: clipboard not available on this system.", file=sys.stderr)
+        except Exception as e:
+            print(f"  --copy failed: {e}", file=sys.stderr)
+
+    print(f"  Share this URL with your GRC manager. They land directly in workspace {workspace_id[:8]}…")
+    print(f"  No account or UUID entry required — the link does it all.\n")
+
+
 _COMMANDS = {
     "scan":      _cmd_scan,
     "init":      _cmd_init,
@@ -2343,8 +2427,9 @@ _COMMANDS = {
     "guard":     _cmd_guard,
     "policy":    _cmd_policy,
     "gates":     _cmd_gates,
-    "webhooks":  _cmd_webhooks,
-    "approvals": _cmd_approvals,
+    "webhooks":       _cmd_webhooks,
+    "approvals":      _cmd_approvals,
+    "generate-link":  _cmd_generate_link,
 }
 
 
@@ -2368,6 +2453,7 @@ def main() -> None:
                 mima gates check|set|unset      Configure and enforce CI governance gates
                 mima webhooks list|register     Manage governance event webhook endpoints
                 mima approvals list|decide      List and action human-approval requests
+                mima generate-link              Generate a shareable dashboard URL for a GRC manager
 
             Run `mima <command> --help` for command-specific options.
 
