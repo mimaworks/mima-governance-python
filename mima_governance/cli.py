@@ -3,15 +3,18 @@
 Usage:
     mima scan <path> [--json] [--include PATTERN]
 
-Known limitations (see --help for details):
-  - Aliased imports (from openai import OpenAI; client = OpenAI()) are not detected.
-  - Class-level @mima decorators do not cover method-level calls inside the class.
-  - Indirect calls through wrappers (my_llm.call()) are not detected.
-  - The tokenizer sees source tokens only; runtime behaviour is not analysed.
+Scanner: AST-based (primary) + tokenizer fallback for syntax-error files.
+The AST scanner detects aliased imports, constructor-assigned handles, and
+uses function-scope attestation rather than a line-proximity heuristic.
+
+Remaining limitations:
+  - Indirect calls through wrapper abstractions (my_llm.call()) are not detected.
+  - Runtime-constructed calls and non-Python code are not analysed.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
 import textwrap
@@ -39,10 +42,161 @@ class Detection(NamedTuple):
     library: str
     attested: bool
     confidence: str  # "high" | "low"
+    method: str = "token"  # "ast" | "token"
 
 
-def _scan_file(path: Path) -> Iterator[Detection]:
-    """Yield detections for a single Python source file."""
+def _get_root_name(node: ast.expr) -> "str | None":
+    """Return the root Name.id from an attribute chain or a bare Name node.
+
+    Examples:
+        Name("client")                           → "client"
+        Attribute(Name("client"), "chat")        → "client"
+        Attribute(Attribute(Name("x"), "y"), "z") → "x"
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _get_root_name(node.value)
+    return None
+
+
+def _has_attest_decorator(node: "ast.FunctionDef | ast.AsyncFunctionDef") -> bool:
+    """Return True if the function has a Mima attestation decorator."""
+    for dec in node.decorator_list:
+        # @mima / @mima_client / @mima_governance  (bare name)
+        if isinstance(dec, ast.Name) and dec.id in _ATTEST_EXACT_NAMES:
+            return True
+        # @mima() / @mima_client()  (called bare name)
+        if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
+            if dec.func.id in _ATTEST_EXACT_NAMES:
+                return True
+        # @anything.attest or @anything.attest(...)
+        attr_node = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(attr_node, ast.Attribute) and attr_node.attr == "attest":
+            return True
+    return False
+
+
+def _scan_file_ast(path: Path) -> "List[Detection] | None":
+    """AST-based scan.  Returns None if ast.parse() fails (caller should fall back).
+
+    Detects:
+    - Direct AI library usage:       openai.chat.completions.create()
+    - Aliased imports:               from openai import OpenAI → OpenAI()
+    - Handle assignments:            client = OpenAI() → client.chat.completions.create()
+    - Function-scope attestation:    @mima.attest() covers every call in the function body
+    """
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    # ── Pass 1: build alias_map and handle_map ────────────────────────────────
+    # alias_map:  local_name  → ai_library  (from import statements)
+    # handle_map: variable    → ai_library  (from constructor assignments)
+    alias_map: dict[str, str] = {}
+    handle_map: dict[str, str] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _AI_LIBRARY_NAMES:
+                    local = alias.asname if alias.asname else root
+                    alias_map[local] = root
+
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            root = module.split(".")[0]
+            if root in _AI_LIBRARY_NAMES:
+                for alias in node.names:
+                    local = alias.asname if alias.asname else alias.name
+                    alias_map[local] = root
+
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value if isinstance(node, ast.Assign) else node.value
+            if value is None or not isinstance(value, ast.Call):
+                continue
+            func = value.func
+            library: "str | None" = None
+
+            if isinstance(func, ast.Name):
+                # client = OpenAI()
+                if func.id in alias_map:
+                    library = alias_map[func.id]
+                elif func.id in _AI_LIBRARY_NAMES:
+                    library = func.id
+            elif isinstance(func, ast.Attribute):
+                # c = anthropic.Anthropic()
+                root_name = _get_root_name(func)
+                if root_name in alias_map:
+                    library = alias_map[root_name]
+                elif root_name in _AI_LIBRARY_NAMES:
+                    library = root_name
+
+            if library:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        handle_map[target.id] = library
+
+    # ── Pass 2: find attested function ranges ─────────────────────────────────
+    # Uses end_lineno (Python 3.8+); falls back to a large offset on older builds.
+    attested_ranges: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _has_attest_decorator(node):
+            continue
+        end = getattr(node, "end_lineno", node.lineno + 9999)
+        attested_ranges.append((node.lineno, end))
+
+    # ── Pass 3: detect call sites ─────────────────────────────────────────────
+    results: List[Detection] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        # Skip bare constructor calls: OpenAI(), Anthropic(), ChatOpenAI(), etc.
+        # These are object instantiation, not AI inference. Inference calls use
+        # attribute chains: client.chat.completions.create()
+        if isinstance(node.func, ast.Name) and node.func.id in alias_map:
+            continue
+
+        root = _get_root_name(node.func)
+        if root is None:
+            continue
+
+        lib: "str | None" = None
+        if root in handle_map:
+            lib = handle_map[root]
+        elif root in alias_map:
+            lib = alias_map[root]
+        elif root in _AI_LIBRARY_NAMES:
+            lib = root
+
+        if lib is None:
+            continue
+
+        call_line = node.lineno
+        attested = any(s <= call_line <= e for s, e in attested_ranges)
+        results.append(Detection(
+            file=str(path),
+            line=call_line,
+            library=lib,
+            attested=attested,
+            confidence="high",
+            method="ast",
+        ))
+
+    return results
+
+
+def _scan_file_token(path: Path) -> Iterator[Detection]:
+    """Tokenizer-based fallback scan (used when ast.parse() fails)."""
     # Single tokenize pass — no dead pre-read, no leaked file handle.
     try:
         with tokenize.open(str(path)) as fh:
@@ -118,6 +272,15 @@ def _scan_file(path: Path) -> Iterator[Detection]:
         )
 
 
+def _scan_file(path: Path) -> Iterator[Detection]:
+    """Scan a single Python file — AST first, tokenizer fallback on SyntaxError."""
+    ast_results = _scan_file_ast(path)
+    if ast_results is not None:
+        yield from ast_results
+        return
+    yield from _scan_file_token(path)
+
+
 _DEFAULT_EXCLUDE_PATTERNS = frozenset([
     "*/mima_governance/*",
     "*/.venv/*",
@@ -127,16 +290,45 @@ _DEFAULT_EXCLUDE_PATTERNS = frozenset([
     "*/.git/*",
 ])
 
+# Directory names that are always skipped during tree walk (prune before descent).
+# This makes scanning a repo with node_modules/venv instant instead of minutes.
+_PRUNE_DIRS = frozenset([
+    ".git", ".venv", "venv", "node_modules", "__pycache__",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
+    ".eggs", "*.egg-info",
+])
+
 
 def _is_excluded(path: Path, exclude_patterns: frozenset) -> bool:
     """Check if a path matches any exclude pattern."""
+    import fnmatch
     path_str = str(path)
-    for pattern in exclude_patterns:
-        # Simple glob-like matching: * matches any segment
-        import fnmatch
-        if fnmatch.fnmatch(path_str, pattern):
-            return True
-    return False
+    return any(fnmatch.fnmatch(path_str, pat) for pat in exclude_patterns)
+
+
+def _walk_python_files(root: Path, exclude_patterns: frozenset) -> "List[Path]":
+    """Walk root, pruning known-noisy directories before descending.
+
+    Uses os.walk() so we can prune directories before rglob descends into them.
+    rglob on a repo with node_modules can take 15+ seconds — os.walk + pruning
+    reduces this to milliseconds.
+    """
+    import os
+    results: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(str(root)):
+        # Prune: remove excluded dirs in-place so os.walk skips them entirely.
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _PRUNE_DIRS
+            and not _is_excluded(Path(dirpath) / d, exclude_patterns)
+        ]
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            fpath = Path(dirpath) / fname
+            if not _is_excluded(fpath, exclude_patterns):
+                results.append(fpath)
+    return results
 
 
 def _scan_path(
@@ -155,9 +347,10 @@ def _scan_path(
 
     exclude_patterns = exclude if exclude is not None else _DEFAULT_EXCLUDE_PATTERNS
 
-    all_paths = list(root.rglob(include)) if root.is_dir() else [root]
-    eligible = [p for p in all_paths
-                if p.suffix == ".py" and not _is_excluded(p, exclude_patterns)]
+    if root.is_dir():
+        eligible = _walk_python_files(root, exclude_patterns)
+    else:
+        eligible = [root] if root.suffix == ".py" else []
 
     if verbose and len(eligible) > 20:
         print(f"  Scanning {len(eligible):,} Python files...", end=" ", flush=True)
@@ -232,6 +425,7 @@ def _print_text(
         print(f"        return {lib}.your_call(...)  # ← this call is now evidenced\n")
         print("  Use --strict to exit 1 on unattested findings (CI/CD gate).")
         print("  Run `mima status` to see how attestation affects compliance scores.\n")
+        _print_compliance_hint(unattested)
 
 
 def _cmd_scan(args: List[str]) -> None:
@@ -253,12 +447,13 @@ def _cmd_scan(args: List[str]) -> None:
                                        .venv/, node_modules/, __pycache__/, .git/)
                 -h, --help          Show this message
 
-            Known limitations:
-                - Aliased imports (from openai import OpenAI; c = OpenAI()) are NOT
-                  detected — the tokenizer sees 'OpenAI.' not 'openai.'.
-                - Class-level @mima decorators do not cover method calls inside the class.
+            Scanner: AST-based (primary) with tokenizer fallback for unparseable files.
+            The AST scanner correctly handles aliased imports and function-scope attestation.
+
+            Remaining limitations:
                 - Indirect calls through wrappers (my_llm.call()) are not detected.
-                - confidence="low" detections may be string literals or comments.
+                - Runtime-constructed calls are not analysed.
+                - confidence="low" (tokenizer fallback only) may be string/comment mentions.
         """))
         sys.exit(0)
 
@@ -308,6 +503,7 @@ def _cmd_scan(args: List[str]) -> None:
                 "library":    d.library,
                 "attested":   d.attested,
                 "confidence": d.confidence,
+                "method":     d.method,
             }
             for d in detections
         ]
@@ -503,9 +699,68 @@ def _cmd_status(args: List[str]) -> None:
 
             Usage:
                 mima status [--json]
+                mima status --demo [path]  # no credentials needed
+
+            Flags:
+                --demo      Show simulated posture using local scan results (no login)
+                --json      Emit raw JSON
 
             Requires: `mima login` first (or MIMA_API_KEY + MIMA_WORKSPACE_ID env vars).
+            Use --demo to preview what the dashboard would show before logging in.
         """))
+        sys.exit(0)
+
+    # ── demo mode (no credentials required) ──────────────────────────────────
+    if "--demo" in args:
+        demo_args = [a for a in args if a != "--demo"]
+        scan_path = demo_args[0] if demo_args and not demo_args[0].startswith("--") else "."
+        print(f"\n  DEMO MODE \u2014 showing simulated posture based on local scan")
+        print(f"  Connect with `mima login` to see real scores.\n")
+
+        import time as _time
+        _t0 = _time.perf_counter()
+        detections, files_scanned = _scan_path(Path(scan_path))
+        _dur = (_time.perf_counter() - _t0) * 1000
+
+        libs = sorted({d.library for d in detections if d.confidence == "high"})
+        unattested = [d for d in detections if not d.attested and d.confidence == "high"]
+        attested   = [d for d in detections if d.attested]
+
+        if libs:
+            print(f"  Detected AI libraries in {scan_path!r}: {', '.join(libs)}")
+            n = len(unattested) + len(attested)
+            pct = int(len(attested) / n * 100) if n else 0
+            print(f"  {n} AI call site(s) found  \u00b7  {len(attested)} attested  \u00b7  {pct}% coverage  ({_dur:.0f}ms)\n")
+        else:
+            print(f"  No AI library calls found in {files_scanned:,} files  ({_dur:.0f}ms)\n")
+
+        # Framework relevance based on libraries detected
+        _fw_map = {
+            "openai":     ["SOC 2 Type II", "ISO 42001", "EU AI Act", "NIST AI RMF"],
+            "anthropic":  ["SOC 2 Type II", "ISO 42001", "EU AI Act", "NIST AI RMF"],
+            "langchain":  ["SOC 2 Type II", "ISO 42001", "EU AI Act"],
+            "llama_index":["SOC 2 Type II", "ISO 42001"],
+            "autogen":    ["SOC 2 Type II", "ISO 42001", "EU AI Act"],
+            "crewai":     ["SOC 2 Type II", "ISO 42001"],
+            "litellm":    ["SOC 2 Type II", "ISO 42001", "EU AI Act"],
+        }
+        relevant: set[str] = {"SOC 2 Type II", "ISO 27001:2022"}
+        for lib in libs:
+            relevant.update(_fw_map.get(lib, []))
+
+        print("  Relevant frameworks based on your stack:")
+        for fw in sorted(relevant):
+            print(f"    {fw}")
+
+        if unattested:
+            print(f"\n  {len(unattested)} unattested call site(s) found.")
+            _print_compliance_hint(unattested)
+
+        print(f"  Next steps:")
+        print(f"    1. mima login                          \u2014 connect to compliance dashboard")
+        print(f"    2. mima scan {scan_path:<25}  \u2014 see all unattested calls")
+        print(f"    3. Add @mima.attest()                  \u2014 wrap AI calls to generate evidence")
+        print(f"    4. mima status                         \u2014 see real readiness scores\n")
         sys.exit(0)
 
     import os
@@ -748,6 +1003,133 @@ def _print_push_delta(
     print()
 
 
+# Local control mapping used for --dry-run (no credentials required).
+# Kept in sync with the server-side evidence_router control table.
+_DRY_RUN_CONTROLS: dict[str, list[tuple[str, str]]] = {
+    "access_review": [
+        ("SOC2_CC6.1",       "Logical and physical access controls"),
+        ("SOC2_CC6.2",       "Prior to issuing system credentials"),
+        ("ISO27001_A.9.2",   "User access management"),
+        ("ISO27001_A.9.4",   "System and application access control"),
+    ],
+    "change_event": [
+        ("SOC2_CC6.1",       "Logical and physical access controls"),
+        ("SOC2_CC8.1",       "Change management"),
+        ("ISO27001_A.12.1",  "Operational procedures and responsibilities"),
+    ],
+    "vendor_risk": [
+        ("SOC2_CC9.2",       "Vendor and business partner risk management"),
+        ("ISO27001_A.15.1",  "Information security in supplier relationships"),
+        ("ISO27001_A.15.2",  "Supplier service delivery management"),
+    ],
+    "policy_acknowledged": [
+        ("SOC2_CC1.4",       "Commitment to competence"),
+        ("SOC2_CC2.2",       "Communication of responsibilities"),
+        ("ISO27001_A.7.2",   "During employment — security awareness"),
+        ("NISTAI_GOV1.1",   "Policies and processes for AI risk management"),
+    ],
+    "incident_report": [
+        ("SOC2_CC7.3",       "Evaluation of security events"),
+        ("SOC2_CC7.4",       "Response to security incidents"),
+        ("ISO27001_A.16.1",  "Management of information security incidents"),
+        ("EUAIA_ART73",      "Reporting of serious incidents to market surveillance"),
+    ],
+    "ai_risk_assessment": [
+        ("EUAIA_ART9",       "Risk management system"),
+        ("EUAIA_ART11",      "Technical documentation"),
+        ("ISO42001_6.1",     "Actions to address AI risks and opportunities"),
+        ("NISTAI_MAP1.1",    "Context is established for framing AI risks"),
+    ],
+    "training_data_governance": [
+        ("EUAIA_ART10",      "Data and data governance practices"),
+        ("ISO42001_6.2",     "AI data governance objectives"),
+        ("NISTAI_MAP2.1",    "Scientific findings and established data"),
+    ],
+    "model_evaluation": [
+        ("EUAIA_ART9",       "Risk management — testing and validation"),
+        ("ISO42001_8.4",     "AI system performance evaluation"),
+        ("NISTAI_MEASURE2.5", "AI system test results are documented"),
+    ],
+    "human_oversight": [
+        ("EUAIA_ART14",      "Human oversight measures"),
+        ("ISO42001_8.6",     "Human oversight of AI systems"),
+        ("NISTAI_GOVERN5.1", "Organizational teams document AI oversight"),
+    ],
+    "model_drift_event": [
+        ("EUAIA_ART9",       "Risk management — post-market monitoring"),
+        ("ISO42001_9.1",     "Monitoring, measurement, analysis and evaluation"),
+        ("NISTAI_MANAGE4.1", "Risk treatments are monitored and documented"),
+    ],
+    "governance_review": [
+        ("SOC2_CC1.1",       "Control environment"),
+        ("SOC2_CC4.1",       "Monitoring of controls"),
+        ("ISO42001_9.3",     "Management review of AI management system"),
+        ("NISTAI_GOVERN1.1", "Policies and processes for AI risk governance"),
+    ],
+}
+
+
+# Maps AI libraries to the record types that best evidence their use.
+# Used to compute compliance delta after mima scan.
+_LIBRARY_RECORD_TYPES: dict[str, list[str]] = {
+    "openai":     ["ai_risk_assessment", "model_evaluation", "human_oversight"],
+    "anthropic":  ["ai_risk_assessment", "model_evaluation", "human_oversight"],
+    "langchain":  ["ai_risk_assessment", "model_evaluation"],
+    "llama_index": ["ai_risk_assessment"],
+    "autogen":    ["ai_risk_assessment", "human_oversight"],
+    "crewai":     ["ai_risk_assessment", "human_oversight"],
+    "litellm":    ["ai_risk_assessment", "model_evaluation"],
+}
+
+# Framework prefix → display name (used in compliance hints)
+_FW_PREFIXES = {
+    "SOC2":    "SOC 2 Type II",
+    "ISO27001": "ISO 27001:2022",
+    "ISO42001": "ISO 42001",
+    "EUAIA":   "EU AI Act",
+    "NISTAI":  "NIST AI RMF",
+}
+
+
+def _print_compliance_hint(unattested: "List[Detection]") -> None:
+    """Show which compliance controls attesting these calls would evidence."""
+    if not unattested:
+        return
+
+    libs = {d.library for d in unattested}
+
+    # Gather all controls reachable by record types relevant to these libraries.
+    rt_controls: dict[str, set[str]] = {}
+    for lib in libs:
+        for rt in _LIBRARY_RECORD_TYPES.get(lib, ["ai_risk_assessment"]):
+            for ctrl_id, _ in _DRY_RUN_CONTROLS.get(rt, []):
+                rt_controls.setdefault(rt, set()).add(ctrl_id)
+
+    if not rt_controls:
+        return
+
+    # Summarise which frameworks would be impacted.
+    fw_ctrl_count: dict[str, int] = {}
+    for ctrl_set in rt_controls.values():
+        for ctrl in ctrl_set:
+            for prefix, label in _FW_PREFIXES.items():
+                if ctrl.startswith(prefix):
+                    fw_ctrl_count[label] = fw_ctrl_count.get(label, 0) + 1
+                    break
+
+    n = len(unattested)
+    print(f"  Attesting {n} call{'s' if n != 1 else ''} would generate evidence across:")
+    for fw_label, count in sorted(fw_ctrl_count.items(), key=lambda x: -x[1]):
+        print(f"    {fw_label:<18}  {count} control{'s' if count != 1 else ''}")
+
+    best_rt = max(rt_controls.items(), key=lambda x: len(x[1]))[0]
+    print(
+        f"\n  Quickest win: push one `{best_rt}` record"
+        f" to evidence {len(rt_controls[best_rt])} controls."
+    )
+    print(f"  Run `mima push {best_rt} --dry-run` to preview the exact mapping.\n")
+
+
 def _cmd_push(args: List[str]) -> None:
     """Handle `mima push <record_type> [field=value ...] [--stdin] [--json]`.
 
@@ -812,6 +1194,30 @@ def _cmd_push(args: List[str]) -> None:
     """
     if not args or args[0] in ("-h", "--help"):
         print(textwrap.dedent(_cmd_push.__doc__ or ""))
+        sys.exit(0)
+
+    # ── dry-run mode (no credentials required) ───────────────────────────────
+    dry_run = "--dry-run" in args
+    if dry_run:
+        dry_args = [a for a in args if a != "--dry-run"]
+        if not dry_args or dry_args[0].startswith("--"):
+            print("mima push --dry-run: specify a record_type, e.g.  mima push change_event --dry-run",
+                  file=sys.stderr)
+            sys.exit(1)
+        record_type = dry_args[0]
+        controls = _DRY_RUN_CONTROLS.get(record_type)
+        if controls is None:
+            valid = ", ".join(_DRY_RUN_CONTROLS)
+            print(f"mima push: unknown record_type '{record_type}'.\n  Valid types: {valid}",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"\n  DRY RUN \u2014 no credentials, nothing sent\n")
+        print(f"  Record:  {record_type}")
+        print(f"  Controls that would be evidenced:")
+        for ctrl_id, description in controls:
+            print(f"    {ctrl_id:<28}  {description}")
+        example = " ".join(dry_args[:3])
+        print(f"\n  To push for real: mima login && mima push {example} ...\n")
         sys.exit(0)
 
     from . import config
@@ -1260,24 +1666,30 @@ class TestAttestation(GovernanceTest):
 
 
 def _cmd_init(args: List[str]) -> None:
-    """Handle `mima init [path] [--output FILE] [--force]`."""
+    """Handle `mima init [path] [--output FILE] [--force] [--hook] [--github-action] [-y]`."""
     if args and args[0] in ("-h", "--help"):
         print(textwrap.dedent("""\
             mima init — generate a governance test file from your codebase
 
             Usage:
-                mima init [path] [--output FILE] [--force]
+                mima init [path] [--output FILE] [--force] [--hook] [--github-action] [-y]
 
             Arguments:
-                path              Codebase path to scan (default: .)
-                --output FILE     Where to write the test file
-                                  (default: tests/test_governance.py)
-                --force           Overwrite existing output file
+                path                Codebase path to scan (default: .)
+                --output FILE       Where to write the test file
+                                    (default: tests/test_governance.py)
+                --force             Overwrite existing output file
+                --hook              Install a pre-commit hook that runs mima scan --strict
+                --github-action     Write .github/workflows/governance.yml
+                --yes / -y          Answer yes to all interactive prompts (CI/scripted use)
 
             What it does:
                 Scans your code for AI library call sites, then generates a
                 GovernanceTest file with assertions you can run immediately
                 and commit to CI/CD.
+
+                When run interactively, prompts to install the pre-commit hook,
+                write the GitHub Actions workflow, and enable the runtime guard.
 
             After running:
                 mima test tests/test_governance.py   # run the generated tests
@@ -1285,10 +1697,14 @@ def _cmd_init(args: List[str]) -> None:
         """))
         sys.exit(0)
 
-    force     = "--force" in args
-    output    = "tests/test_governance.py"
-    scan_path = "."
-    clean     = [a for a in args if a != "--force"]
+    force          = "--force" in args
+    install_hook   = "--hook" in args
+    github_action  = "--github-action" in args
+    yes_all        = "--yes" in args or "-y" in args
+    output         = "tests/test_governance.py"
+    scan_path      = "."
+    _skip_flags    = frozenset(["--force", "--hook", "--github-action", "--yes", "-y"])
+    clean          = [a for a in args if a not in _skip_flags]
 
     i = 0
     while i < len(clean):
@@ -1360,12 +1776,262 @@ def _cmd_init(args: List[str]) -> None:
     print(f"    TestAttestation.test_coverage_threshold"
           f"   \u2014 assert \u226580% attested")
     print(f"\n  Run:    mima test {output}")
-    print(f"\n  Add to CI/CD (.github/workflows/governance.yml):")
-    print(f"    - name: Governance check")
-    print(f"      run: |")
-    print(f"        pip install mima-governance")
-    print(f"        mima test {output}")
+
+    # Determine interaction mode:
+    #   - interactive: stdin is a tty and --yes not passed → prompt
+    #   - yes_all:     --yes/-y or non-tty → accept defaults silently
+    _interactive = sys.stdin.isatty() and not yes_all
+
+    # ── Pre-commit hook ────────────────────────────────────────────────────────
+    if install_hook or _prompt_yes_no(
+        "Install pre-commit hook? (blocks commits with unattested AI calls)",
+        default=True,
+        interactive=_interactive,
+        yes_all=yes_all,
+    ):
+        _install_pre_commit_hook(scan_path, output)
+
+    # ── GitHub Actions workflow ────────────────────────────────────────────────
+    if github_action or _prompt_yes_no(
+        "Write .github/workflows/governance.yml? (runs mima test on every push)",
+        default=True,
+        interactive=_interactive,
+        yes_all=yes_all,
+    ):
+        _write_github_action(output)
+
+    # ── Runtime guard ──────────────────────────────────────────────────────────
+    if libs:
+        _prompt_runtime_guard(scan_path, libs, interactive=_interactive, yes_all=yes_all)
+
     print(f"\n  Next: `mima login` to connect results to your compliance dashboard.\n")
+
+
+def _prompt_yes_no(
+    question: str,
+    default: bool = True,
+    interactive: bool = True,
+    yes_all: bool = False,
+) -> bool:
+    """Prompt user Y/n.  Returns default when non-interactive; True when yes_all."""
+    if yes_all:
+        return True
+    if not interactive:
+        return False  # non-interactive without --yes: skip optional steps
+    yn = "Y/n" if default else "y/N"
+    try:
+        raw = input(f"\n  {question} [{yn}] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
+
+_ENTRY_POINT_CANDIDATES = [
+    "main.py", "app.py", "server.py", "run.py", "__main__.py",
+    "index.py", "wsgi.py", "asgi.py", "manage.py",
+]
+
+
+def _find_entry_point(scan_path: str) -> "Path | None":
+    """Return the first candidate entry point found under scan_path."""
+    root = Path(scan_path)
+    for name in _ENTRY_POINT_CANDIDATES:
+        candidate = root / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _patch_entry_point_with_guard(entry: Path) -> bool:
+    """Insert enable_guard() call after the last import block in entry.
+
+    Returns True if patched, False if already present or patch failed.
+    """
+    source = entry.read_text(encoding="utf-8")
+    if "enable_guard" in source or "mima_governance.guard" in source:
+        return False  # already configured
+
+    lines = source.splitlines(keepends=True)
+    last_import_idx = -1
+    for i, line in enumerate(lines[:60]):  # only scan first 60 lines
+        stripped = line.lstrip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            last_import_idx = i
+
+    insert_at = last_import_idx + 1 if last_import_idx >= 0 else 0
+    guard_lines = [
+        "\nfrom mima_governance.guard import enable_guard\n",
+        "enable_guard(mode=\"warn\")  # mima: warn | block | report\n",
+    ]
+    lines[insert_at:insert_at] = guard_lines
+    entry.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _prompt_runtime_guard(
+    scan_path: str,
+    libs: "List[str]",
+    interactive: bool,
+    yes_all: bool,
+) -> None:
+    """Offer to enable the runtime guard in the detected entry point."""
+    entry = _find_entry_point(scan_path)
+    entry_name = entry.name if entry else "your entry point (main.py / app.py)"
+
+    if _prompt_yes_no(
+        f"Enable runtime guard in {entry_name}? "
+        f"(warns when {libs[0] if libs else 'AI'} calls are made outside @mima.attest())",
+        default=True,
+        interactive=interactive,
+        yes_all=yes_all,
+    ):
+        if entry:
+            patched = _patch_entry_point_with_guard(entry)
+            if patched:
+                print(f"\n  Runtime guard enabled in {entry}")
+                print(f"  Mode: warn — unattested AI calls emit UserWarning.")
+                print(f"  Change to block to fail hard, or report to log silently.")
+            else:
+                print(f"\n  Runtime guard already configured in {entry} — skipped.")
+        else:
+            # No entry point found — show snippet
+            print(f"\n  Runtime guard: add to your entry point:")
+            print(f"    from mima_governance.guard import enable_guard")
+            print(f"    enable_guard(mode=\"warn\")  # warn | block | report")
+    else:
+        # User declined — show the snippet anyway as a reminder
+        print(f"\n  To enable later: add to {entry_name}:")
+        print(f"    from mima_governance.guard import enable_guard")
+        print(f"    enable_guard(mode=\"warn\")")
+
+
+_HOOK_MARKER = "# mima-governance pre-commit hook"
+_HOOK_SCRIPT = """\
+{marker}
+mima scan . --strict
+exit_code=$?
+if [ $exit_code -ne 0 ]; then
+  echo ""
+  echo "  mima: unattested AI call sites found — commit blocked."
+  echo "  Add @mima.attest() decorators or run 'mima scan . --help' for guidance."
+  echo "  To skip this check: git commit --no-verify"
+  echo ""
+  exit $exit_code
+fi
+"""
+
+_GITHUB_ACTION_TEMPLATE = """\
+name: Governance Check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install mima-governance
+        run: pip install mima-governance
+      - name: Run governance tests
+        run: mima test {test_file}
+"""
+
+
+def _install_pre_commit_hook(scan_path: str, test_file: str) -> None:
+    """Write or append a pre-commit hook that runs mima scan --strict."""
+    import os
+    import stat
+
+    hook_path = Path(".git") / "hooks" / "pre-commit"
+    if not (Path(".git")).exists():
+        print(f"\n  Warning: .git not found — skipping pre-commit hook installation.")
+        print(f"  Run `mima init --hook` from the root of your git repository.\n")
+        return
+
+    hook_path.parent.mkdir(parents=True, exist_ok=True)
+    script = _HOOK_SCRIPT.format(marker=_HOOK_MARKER)
+
+    if hook_path.exists():
+        existing = hook_path.read_text()
+        if _HOOK_MARKER in existing:
+            print(f"\n  Pre-commit hook already installed: {hook_path}")
+            print(f"  (already contains mima scan block — skipping)\n")
+            return
+        # Append to existing hook with a newline separator
+        with hook_path.open("a") as fh:
+            fh.write("\n" + script)
+        print(f"\n  Pre-commit hook updated (appended): {hook_path}\n")
+    else:
+        hook_path.write_text("#!/usr/bin/env bash\nset -e\n\n" + script)
+        print(f"\n  Pre-commit hook installed: {hook_path}")
+        print(f"  Every commit will now fail if unattested AI calls are introduced.")
+        print(f"  Remove with: rm {hook_path}\n")
+
+    # Ensure the hook is executable
+    current = os.stat(hook_path).st_mode
+    os.chmod(hook_path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _write_github_action(test_file: str) -> None:
+    """Write .github/workflows/governance.yml."""
+    wf_path = Path(".github") / "workflows" / "governance.yml"
+    if wf_path.exists():
+        print(f"\n  GitHub Actions workflow already exists: {wf_path} — skipping.\n")
+        return
+    wf_path.parent.mkdir(parents=True, exist_ok=True)
+    wf_path.write_text(_GITHUB_ACTION_TEMPLATE.format(test_file=test_file))
+    print(f"\n  GitHub Actions workflow written: {wf_path}")
+    print(f"  Runs `mima test {test_file}` on every push and pull request.\n")
+
+
+def _cmd_guard(args: List[str]) -> None:
+    """mima guard start|stop|status — manage the guard sidecar daemon."""
+    import argparse
+    from mima_governance import daemon as dm
+
+    parser = argparse.ArgumentParser(
+        prog="mima guard",
+        description="Manage the mima guard sidecar daemon.",
+    )
+    sub = parser.add_subparsers(dest="subcmd")
+
+    start_p = sub.add_parser("start", help="Start the guard daemon")
+    start_p.add_argument(
+        "--mode",
+        choices=["warn", "block", "report"],
+        default="warn",
+        help="Guard enforcement mode (default: warn)",
+    )
+    start_p.add_argument(
+        "--forward",
+        action="store_true",
+        help="Forward events to the Mima platform in real time",
+    )
+
+    sub.add_parser("stop",   help="Stop the guard daemon")
+    sub.add_parser("status", help="Show daemon status (exits 0 if running, 1 if not)")
+
+    parsed = parser.parse_args(args)
+
+    if parsed.subcmd == "start":
+        dm.start_daemon(mode=parsed.mode, forward=getattr(parsed, "forward", False))
+    elif parsed.subcmd == "stop":
+        dm.stop_daemon()
+    elif parsed.subcmd == "status":
+        dm.status_daemon()
+    else:
+        parser.print_help()
+        sys.exit(0)
 
 
 _COMMANDS = {
@@ -1375,6 +2041,7 @@ _COMMANDS = {
     "status": _cmd_status,
     "test":   _cmd_test,
     "push":   _cmd_push,
+    "guard":  _cmd_guard,
 }
 
 
@@ -1393,6 +2060,7 @@ def main() -> None:
                 mima status               Show certification readiness scores
                 mima login                Authenticate with the Mima API
                 mima push <record_type>   Push a GRC evidence record from CI/CD
+                mima guard start|stop|status   Manage the guard sidecar daemon
 
             Run `mima <command> --help` for command-specific options.
 
