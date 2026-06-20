@@ -28,6 +28,13 @@ process level and catches everything the scanner cannot — wrappers, dynamic
 dispatch, and cross-thread calls — at ~1 µs overhead per call.  Run the
 scanner in CI for shift-left feedback; run the guard in production for
 complete coverage.
+
+IMPORTANT: this scanner is a developer-feedback mechanism, not an evidence
+generator.  "mima scan shows 0 unattested calls" does NOT mean you have
+compliance evidence.  Only explicit attestation (@mima.attest / OTEL spans)
+and evidence pushes (mima push / MimaGovernance SDK) produce auditable
+records for the GRC ledger.  The scanner finds WHERE you need attestation;
+the attestation itself produces evidence.
 """
 
 from __future__ import annotations
