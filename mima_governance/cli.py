@@ -7,9 +7,27 @@ Scanner: AST-based (primary) + tokenizer fallback for syntax-error files.
 The AST scanner detects aliased imports, constructor-assigned handles, and
 uses function-scope attestation rather than a line-proximity heuristic.
 
-Remaining limitations:
-  - Indirect calls through wrapper abstractions (my_llm.call()) are not detected.
-  - Runtime-constructed calls and non-Python code are not analysed.
+Design boundary — what this scanner intentionally does not cover:
+
+  Wrapper abstractions (my_llm.call()) — detecting these requires
+  inter-procedural call-graph analysis with full type inference across the
+  entire codebase.  This is O(codebase × call depth), undecidable when the
+  wrapper is in a third-party library, and produces high false-positive rates
+  from unrelated methods with common names (complete, call, generate).  Use
+  enable_guard() for runtime coverage of wrapped calls instead.
+
+  Runtime-constructed calls — getattr / importlib patterns are unknowable at
+  parse time by definition.  No static analyser can solve this.  Again, the
+  runtime guard patches the underlying library entry points directly, so these
+  are caught regardless of how many dynamic layers wrap them.
+
+  Non-Python code — out of scope for a Python AST tool.
+
+enable_guard() is the complement: it instruments library entry points at the
+process level and catches everything the scanner cannot — wrappers, dynamic
+dispatch, and cross-thread calls — at ~1 µs overhead per call.  Run the
+scanner in CI for shift-left feedback; run the guard in production for
+complete coverage.
 """
 
 from __future__ import annotations
