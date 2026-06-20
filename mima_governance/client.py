@@ -108,12 +108,18 @@ class MimaGovernance(_MimaGrcMixin):
         def decorator(fn: Callable) -> Callable:
             @functools.wraps(fn)
             def wrapper(*args: Any, **kwargs: Any) -> Any:
-                input_data = _serialize_for_hash(args, kwargs)
-                input_hash = _sha256(input_data)
-
-                result = fn(*args, **kwargs)
-
-                output_hash = _sha256(_serialize_for_hash(result))
+                import sys
+                _guard = sys.modules.get("mima_governance.guard")
+                if _guard and _guard._guard_enabled:
+                    _guard._set_attested(True)
+                try:
+                    input_data = _serialize_for_hash(args, kwargs)
+                    input_hash = _sha256(input_data)
+                    result = fn(*args, **kwargs)
+                    output_hash = _sha256(_serialize_for_hash(result))
+                finally:
+                    if _guard and _guard._guard_enabled:
+                        _guard._set_attested(False)
 
                 record = AttestationRecord(
                     tool_name=tool_name,

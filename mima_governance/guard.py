@@ -30,6 +30,60 @@ from typing import Any, Callable
 
 from mima_governance.daemon import _SOCK_PATH
 
+# ── OpenTelemetry detection (cached, fail-safe) ─────────────────────────────
+
+_otel_checked: bool = False
+_otel_available: bool = False
+
+
+def _has_configured_otel() -> bool:
+    """Return True if opentelemetry-api is installed AND a real TracerProvider
+    (not the default proxy/no-op) is configured.
+
+    Result is cached after first call.  Any exception falls safe to False so the
+    daemon/queue path is used instead.
+    """
+    global _otel_checked, _otel_available
+    if _otel_checked:
+        return _otel_available
+    try:
+        from opentelemetry import trace
+        from opentelemetry.trace import NoOpTracerProvider, ProxyTracerProvider
+
+        provider = trace.get_tracer_provider()
+        # ProxyTracerProvider is the default when no SDK is installed/configured.
+        # NoOpTracerProvider is what you get when explicitly set to no-op.
+        # Both mean "OTEL is not meaningfully configured."
+        _otel_available = not isinstance(
+            provider, (NoOpTracerProvider, ProxyTracerProvider)
+        )
+    except Exception:
+        _otel_available = False
+    _otel_checked = True
+    return _otel_available
+
+
+def _emit_otel_span(name: str) -> bool:
+    """Emit an OTEL span for an unattested AI call.
+
+    Returns True on success, False on any failure.  Never raises.
+    """
+    try:
+        from opentelemetry import trace
+
+        from mima_governance.config import get_workspace_id
+
+        tracer = trace.get_tracer("mima.guard", "0.3.0")
+        with tracer.start_as_current_span("mima.ai_call") as span:
+            span.set_attribute("mima.call_site", name)
+            span.set_attribute("mima.attested", False)
+            ws_id = get_workspace_id()
+            if ws_id:
+                span.set_attribute("mima.workspace_id", ws_id)
+        return True
+    except Exception:
+        return False
+
 # ── Attestation context ──────────────────────────────────────────────────────
 
 # Async context (asyncio tasks inherit a copy, so concurrent tasks are isolated).
@@ -224,15 +278,23 @@ def _send_via_socket(entry: dict, sock_path: "Path | None" = None) -> bool:
 
 
 def _append_report(name: str) -> None:
-    """Send an unattested call record to the guard daemon (socket-first).
+    """Send an unattested call record via the best available channel.
 
-    Socket path: ~/.mima/guard.sock (daemon running) → entry lands in the
-    daemon's guard_log.jsonl.  If the socket is absent the call falls back to
-    the in-process queue + background thread, preserving single-process
-    behaviour with no breaking change.
+    Priority:
+      1. OpenTelemetry span (if a configured TracerProvider is present)
+      2. Daemon Unix socket (~/.mima/guard.sock)
+      3. In-process queue + background thread
 
     Non-blocking: queue.put_nowait drops silently when full (> 10 000 items).
+    Never raises to the caller.
     """
+    try:
+        if _has_configured_otel():
+            if _emit_otel_span(name):
+                return
+    except Exception:
+        pass  # Fall through to daemon/queue path.
+
     import os
     from datetime import datetime, timezone
 

@@ -138,9 +138,18 @@ class AsyncMimaGovernance(_MimaGrcMixin):
 
             @functools.wraps(fn)
             async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                input_hash = _sha256(_serialize_for_hash(args, kwargs))
-                result = await fn(*args, **kwargs)
-                output_hash = _sha256(_serialize_for_hash(result))
+                import sys
+                _guard = sys.modules.get("mima_governance.guard")
+                _token = None
+                if _guard and _guard._guard_enabled:
+                    _token = _guard._set_attested_async(True)
+                try:
+                    input_hash = _sha256(_serialize_for_hash(args, kwargs))
+                    result = await fn(*args, **kwargs)
+                    output_hash = _sha256(_serialize_for_hash(result))
+                finally:
+                    if _guard and _guard._guard_enabled and _token is not None:
+                        _guard._async_attested.reset(_token)
 
                 record = AttestationRecord(
                     tool_name=tool_name,

@@ -118,13 +118,19 @@ Inferred records are marked "indicative only" in the dashboard until a workspace
 
 ## Scan limitations
 
-`mima scan` uses static token analysis. It detects AI library calls of the form `openai.`, `anthropic.`, `langchain.`, etc. It does **not** detect:
+`mima scan` uses AST-based analysis (with a tokenizer fallback for files that can't be parsed). It correctly detects:
 
-- **Aliased imports:** `from openai import OpenAI; client = OpenAI()` — the token `openai.` never appears
-- **Wrapper abstractions:** `my_llm.generate()` — the library name is not visible at the call site
+- **Direct usage:** `openai.chat.completions.create()`
+- **Aliased imports:** `from openai import OpenAI; client = OpenAI(); client.chat.completions.create()`
+- **Constructor-assigned handles:** `client = OpenAI()` → `client.chat.completions.create()`
+- **Function-scope attestation:** `@mima.attest()` covers every AI call in the decorated function body, not just the nearest lines
+
+It does **not** detect:
+
+- **Wrapper abstractions:** `my_llm.generate()` where `my_llm` is not a direct AI constructor assignment
 - **Runtime-constructed calls** or non-Python code
 
-When `mima scan` reports zero unattested calls, it means the tokeniser found none — not that none exist. Use `--strict` as a CI gate for what the scanner can see; complement it with code review for abstractions it cannot reach.
+When `mima scan` reports zero unattested calls, the AST scanner found none in reachable call sites — not that none exist. Use `--strict` as a CI gate; complement with code review for deep wrapper abstractions it cannot reach.
 
 ## Readiness score — how it's calculated
 

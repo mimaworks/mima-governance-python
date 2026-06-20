@@ -306,6 +306,8 @@ class TestSocketFallback:
         from mima_governance import guard
         monkeypatch.setattr(guard, "_guard_enabled", True)
         monkeypatch.setattr(guard, "_guard_mode", "report")
+        # Force OTEL path to be skipped so this test exercises the daemon/queue fallback.
+        monkeypatch.setattr(guard, "_has_configured_otel", lambda: False)
 
         queued = []
 

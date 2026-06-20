@@ -143,14 +143,24 @@ class TestCmdInit:
         assert "GovernanceTest" in content
 
     def test_init_ci_snippet_in_output(self, tmp_path, capsys):
+        """mima init --github-action writes the workflow file with pip install snippet."""
         out_file = tmp_path / "test_gov.py"
-        with patch("sys.argv", ["mima", "init", str(tmp_path),
-                                 "--output", str(out_file)]):
-            from mima_governance.cli import main
-            main()
+        import os
+        old_dir = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with patch("sys.argv", ["mima", "init", str(tmp_path),
+                                     "--output", str(out_file), "--github-action"]):
+                from mima_governance.cli import main
+                main()
+        finally:
+            os.chdir(old_dir)
         out = capsys.readouterr().out
-        assert "pip install mima-governance" in out
         assert "mima login" in out
+        # Workflow file contains the pip install snippet
+        wf = tmp_path / ".github" / "workflows" / "governance.yml"
+        assert wf.exists()
+        assert "pip install mima-governance" in wf.read_text()
 
 
 class TestCmdLogin:
