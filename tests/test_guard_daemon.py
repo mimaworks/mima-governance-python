@@ -388,6 +388,202 @@ class TestCliCommands:
                     assert "stopped" in out
 
 
+# ── TestForwarder ─────────────────────────────────────────────────────────────
+
+class TestForwarder:
+    """_start_forwarder: batch POST, 401 disables, network error retries."""
+
+    @staticmethod
+    def _mock_response(status_code: int = 200) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = status_code
+        return resp
+
+    def test_batch_posts_all_queued_events(self):
+        """All events in the queue are included in one POST batch."""
+        from mima_governance.daemon import _start_forwarder
+        import queue as _queue
+
+        fq = _queue.Queue()
+        stop = threading.Event()
+        posted = []
+
+        entries = [
+            {"ts": "2026-06-20T00:00:01+00:00", "call": "openai.chat", "pid": 1},
+            {"ts": "2026-06-20T00:00:02+00:00", "call": "anthropic.messages", "pid": 2},
+        ]
+        for e in entries:
+            fq.put(e)
+
+        with patch("httpx.post", return_value=self._mock_response(200)) as mock_post:
+            t = threading.Thread(
+                target=_start_forwarder,
+                args=(fq, "key_test", "ws_abc", "https://api.mima.ai", stop),
+                kwargs={"interval": 0.1},
+                daemon=True,
+            )
+            t.start()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if mock_post.call_count >= 1:
+                    break
+                time.sleep(0.05)
+            stop.set()
+            t.join(timeout=3.0)
+
+        assert mock_post.call_count >= 1
+        _, kwargs = mock_post.call_args
+        events_sent = kwargs["json"]["events"]
+        calls = [e["call"] for e in events_sent]
+        assert "openai.chat" in calls
+        assert "anthropic.messages" in calls
+
+    def test_post_uses_correct_url_and_auth(self):
+        """POST targets the workspace endpoint with Bearer auth."""
+        from mima_governance.daemon import _start_forwarder
+        import queue as _queue
+
+        fq = _queue.Queue()
+        stop = threading.Event()
+        fq.put({"ts": "2026-06-20T00:00:00+00:00", "call": "test", "pid": 1})
+
+        with patch("httpx.post", return_value=self._mock_response(200)) as mock_post:
+            t = threading.Thread(
+                target=_start_forwarder,
+                args=(fq, "mima_key_xyz", "ws_123", "https://api.mima.ai", stop),
+                kwargs={"interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if mock_post.call_count >= 1:
+                    break
+                time.sleep(0.05)
+            stop.set()
+            t.join(timeout=3.0)
+
+        assert mock_post.call_count >= 1
+        url_arg = mock_post.call_args[0][0]
+        assert "ws_123" in url_arg
+        assert "guard/events" in url_arg
+        headers = mock_post.call_args[1]["headers"]
+        assert headers.get("Authorization") == "Bearer mima_key_xyz"
+
+    def test_401_disables_further_posts(self):
+        """A 401 response causes the forwarder to stop making POST attempts."""
+        from mima_governance.daemon import _start_forwarder
+        import queue as _queue
+
+        fq = _queue.Queue()
+        stop = threading.Event()
+        call_count = [0]
+
+        def fake_post(url, **kwargs):
+            call_count[0] += 1
+            return self._mock_response(401)
+
+        for i in range(5):
+            fq.put({"ts": "2026-06-20T00:00:00+00:00", "call": f"test.{i}", "pid": i})
+
+        with patch("httpx.post", side_effect=fake_post):
+            t = threading.Thread(
+                target=_start_forwarder,
+                args=(fq, "bad_key", "ws_abc", "https://api.mima.ai", stop),
+                kwargs={"interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.5)  # Allow multiple cycles
+            stop.set()
+            t.join(timeout=3.0)
+
+        assert call_count[0] == 1, f"Expected 1 POST (then disabled), got {call_count[0]}"
+
+    def test_network_error_retries_next_cycle(self):
+        """Network errors requeue events so they are included in the next flush."""
+        from mima_governance.daemon import _start_forwarder
+        import queue as _queue
+
+        fq = _queue.Queue()
+        stop = threading.Event()
+        batch_sizes = []
+
+        def fake_post(url, **kwargs):
+            batch_sizes.append(len(kwargs["json"]["events"]))
+            if len(batch_sizes) == 1:
+                raise OSError("connection refused")
+            return self._mock_response(200)
+
+        fq.put({"ts": "2026-06-20T00:00:00+00:00", "call": "openai.chat", "pid": 1})
+
+        with patch("httpx.post", side_effect=fake_post):
+            t = threading.Thread(
+                target=_start_forwarder,
+                args=(fq, "key_test", "ws_abc", "https://api.mima.ai", stop),
+                kwargs={"interval": 0.1},
+                daemon=True,
+            )
+            t.start()
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if len(batch_sizes) >= 2:
+                    break
+                time.sleep(0.05)
+            stop.set()
+            t.join(timeout=3.0)
+
+        assert len(batch_sizes) >= 2, "Expected retry after network error"
+        assert batch_sizes[1] >= 1, "Retry batch should contain the requeued event"
+
+    def test_no_post_when_queue_empty(self):
+        """Forwarder does not call httpx.post if the queue is empty."""
+        from mima_governance.daemon import _start_forwarder
+        import queue as _queue
+
+        fq = _queue.Queue()
+        stop = threading.Event()
+
+        with patch("httpx.post") as mock_post:
+            t = threading.Thread(
+                target=_start_forwarder,
+                args=(fq, "key_test", "ws_abc", "https://api.mima.ai", stop),
+                kwargs={"interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.3)
+            stop.set()
+            t.join(timeout=3.0)
+
+        assert mock_post.call_count == 0
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="fork-based daemon Unix only")
+    def test_forward_without_credentials_starts_daemon(self, tmp_path, capsys):
+        """--forward with no credentials: daemon starts (prints 'started'), prints warning."""
+        from mima_governance import daemon as dm
+
+        with patch.object(dm, "_PID_PATH", tmp_path / "guard.pid"):
+            with patch.object(dm, "_SOCK_PATH", tmp_path / "guard.sock"):
+                with patch.object(dm, "_LOG_PATH", tmp_path / "guard_log.jsonl"):
+                    with patch("mima_governance.config.get_api_key", return_value=None):
+                        with patch("mima_governance.config.get_workspace_id", return_value=None):
+                            dm.start_daemon(mode="report", forward=True)
+
+        out = capsys.readouterr().out
+        assert "started" in out
+        assert "no credentials" in out.lower() or "forwarding disabled" in out.lower() or "warning" in out.lower()
+
+        # Clean up forked child
+        pid = dm._read_pid(tmp_path / "guard.pid")
+        if pid and dm._is_running(pid):
+            try:
+                import os as _os
+                _os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
 # ── TestCountRecentEvents ─────────────────────────────────────────────────────
 
 class TestCountRecentEvents:

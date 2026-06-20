@@ -135,12 +135,23 @@ class GuardDaemon:
         sock_path: "Path | str" = _SOCK_PATH,
         pid_path:  "Path | str" = _PID_PATH,
         log_path:  "Path | str" = _LOG_PATH,
+        *,
+        api_key: "str | None" = None,
+        workspace_id: "str | None" = None,
+        base_url: "str | None" = None,
     ) -> None:
         self._sock_path = Path(sock_path)
         self._pid_path  = Path(pid_path)
         self._log_path  = Path(log_path)
         self._stop      = threading.Event()
         self._queue: "queue.Queue[dict | None]" = queue.Queue(maxsize=10_000)
+        # Forwarding (optional).
+        self._api_key = api_key
+        self._workspace_id = workspace_id
+        self._base_url = base_url or "https://api.mima.ai"
+        self._forward_queue: "queue.Queue[dict] | None" = (
+            queue.Queue(maxsize=10_000) if api_key and workspace_id else None
+        )
 
     # ── Public control ────────────────────────────────────────────────────────
 
@@ -165,6 +176,23 @@ class GuardDaemon:
             name="mima-guard-drain",
         )
         drain_thread.start()
+
+        # Start forwarder thread if credentials were provided.
+        forwarder_thread = None
+        if self._forward_queue is not None:
+            forwarder_thread = threading.Thread(
+                target=_start_forwarder,
+                args=(
+                    self._forward_queue,
+                    self._api_key,
+                    self._workspace_id,
+                    self._base_url,
+                    self._stop,
+                ),
+                daemon=True,
+                name="mima-guard-forwarder",
+            )
+            forwarder_thread.start()
 
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -222,6 +250,11 @@ class GuardDaemon:
                     self._queue.put_nowait(entry)
                 except queue.Full:
                     pass
+                if self._forward_queue is not None:
+                    try:
+                        self._forward_queue.put_nowait(entry)
+                    except queue.Full:
+                        pass
             except Exception:
                 pass
 
@@ -242,6 +275,57 @@ class GuardDaemon:
                 pass
 
 
+# ── Forwarder ─────────────────────────────────────────────────────────────────
+
+def _start_forwarder(
+    forward_queue: "queue.Queue[dict]",
+    api_key: str,
+    workspace_id: str,
+    base_url: str,
+    stop_event: threading.Event,
+    *,
+    interval: float = 5.0,
+) -> None:
+    """Background thread: drain *forward_queue* → POST batch every *interval* seconds.
+
+    On 401/403 the forwarder disables itself permanently (no retry storm).
+    On network errors the events are requeued for the next cycle.
+    """
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/guard/events"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    while not stop_event.is_set():
+        stop_event.wait(interval)
+        if stop_event.is_set():
+            break
+
+        # Drain up to 100 events.
+        events: list[dict] = []
+        while len(events) < 100:
+            try:
+                events.append(forward_queue.get_nowait())
+            except queue.Empty:
+                break
+
+        if not events:
+            continue
+
+        try:
+            resp = httpx.post(url, json={"events": events}, headers=headers, timeout=10.0)
+            if resp.status_code in (401, 403):
+                # Credentials invalid — disable permanently.
+                return
+        except Exception:
+            # Network error — requeue for next cycle.
+            for e in events:
+                try:
+                    forward_queue.put_nowait(e)
+                except queue.Full:
+                    pass
+
+
 # ── CLI-facing public API ─────────────────────────────────────────────────────
 
 def start_daemon(mode: str = "warn", forward: bool = False) -> None:
@@ -250,6 +334,22 @@ def start_daemon(mode: str = "warn", forward: bool = False) -> None:
     if existing_pid and _is_running(existing_pid):
         print(f"Guard daemon already running (PID {existing_pid})")
         return
+
+    # Resolve forwarding credentials in the parent process (before fork).
+    api_key: "str | None" = None
+    workspace_id: "str | None" = None
+    base_url: str = "https://api.mima.ai"
+    forward_warning: str = ""
+
+    if forward:
+        from mima_governance import config
+        api_key = config.get_api_key()
+        workspace_id = config.get_workspace_id()
+        base_url = config.get_base_url()
+        if not api_key or not workspace_id:
+            forward_warning = "Warning: forwarding disabled (no credentials). Run 'mima login' first."
+            api_key = None
+            workspace_id = None
 
     first_fork = os.fork()
     if first_fork > 0:
@@ -260,6 +360,8 @@ def start_daemon(mode: str = "warn", forward: bool = False) -> None:
                 break
             time.sleep(0.05)
         daemon_pid = _read_pid(_PID_PATH)
+        if forward_warning:
+            print(forward_warning)
         print(f"Guard daemon started (PID {daemon_pid})")
         return
 
@@ -284,7 +386,14 @@ def start_daemon(mode: str = "warn", forward: bool = False) -> None:
     except OSError:
         pass
 
-    daemon = GuardDaemon(sock_path=_SOCK_PATH, pid_path=_PID_PATH, log_path=_LOG_PATH)
+    daemon = GuardDaemon(
+        sock_path=_SOCK_PATH,
+        pid_path=_PID_PATH,
+        log_path=_LOG_PATH,
+        api_key=api_key,
+        workspace_id=workspace_id,
+        base_url=base_url,
+    )
     _write_pid(_PID_PATH, os.getpid())
 
     def _sigterm(sig: int, frame: object) -> None:
