@@ -1,6 +1,17 @@
 # mima-governance
 
-Attest AI executions, push GRC evidence records, and run governance policy tests against your codebase — with or without a Mima account.
+Attest AI executions, push GRC evidence records, and run governance policy tests — one call maps to EU AI Act, ISO 42001, SOC 2, and NIST AI RMF simultaneously.
+
+## Four frameworks, one attestation call
+
+| Framework | What it covers |
+|---|---|
+| EU AI Act | Art. 9 risk assessments, Art. 13 transparency, Art. 14 human oversight, Art. 15 accuracy |
+| ISO 42001 | AI management system controls — A.6.x risk treatment, A.9.x performance evaluation |
+| SOC 2 | CC3.x risk assessment, CC5.x control activities, CC7.x change management |
+| NIST AI RMF | GOVERN, MAP, MEASURE, MANAGE functions |
+
+One `@mima.attest()` call earns controls across whichever frameworks apply — no per-regulation wiring, no separate pipelines. `human_oversight` earns `EUAIA_ART14`, `EUAIA_ART13`, `ISO42001_A.6.6`, and `NIST_GOV1` in a single write. Your readiness score updates across all four.
 
 ## No account needed to start
 
@@ -24,18 +35,19 @@ pip install mima-governance
 from mima_governance import MimaGovernance
 
 mima = MimaGovernance(
-    workspace_id="your-workspace-id",
     api_key="mima_ext_...",
     system_name="my-ai-pipeline",
 )
+# workspace_id is resolved automatically from the API key.
 
 # Decorator — wraps a function; every call writes a GRC evidence record
+# and maps to applicable controls across EU AI Act, ISO 42001, SOC 2, NIST AI RMF
 @mima.attest(tool_name="generate_report")
 def generate_report(data):
     return call_llm(data)
 ```
 
-Each `@mima.attest()` call writes a row to `v2.grc_evidence_records` with `source = 'sdk'`. These records map automatically to SOC 2, ISO 27001:2022, ISO 42001, EU AI Act, and NIST AI RMF controls — that cross-framework mapping is what evidences the compliance dashboard.
+Each `@mima.attest()` call writes a row to `v2.grc_evidence_records` with `source = 'sdk'`. The cross-framework control mapping is automatic — the same record that evidences `EUAIA_ART13` also earns `ISO42001_A.6.2` and the relevant NIST AI RMF function. That compounding is what makes mima different from a per-regulation tool.
 
 ## Framework Integrations
 
@@ -79,7 +91,6 @@ from nacl.signing import SigningKey
 key = SigningKey.generate()
 
 mima = MimaGovernance(
-    workspace_id="...",
     api_key="...",
     system_name="...",
     signing_key=key.encode(),  # 32-byte seed
