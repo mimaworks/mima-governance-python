@@ -1103,6 +1103,18 @@ _DRY_RUN_CONTROLS: dict[str, list[tuple[str, str]]] = {
         ("ISO42001_9.3",     "Management review of AI management system"),
         ("NISTAI_GOVERN1.1", "Policies and processes for AI risk governance"),
     ],
+    "quality_management_review": [
+        ("EUAIA_ART17",      "Quality management system — documented procedures"),
+        ("ISO42001_A.6.1",   "AI risk management process"),
+        ("ISO42001_A.6.3",   "Testing and validation procedures"),
+        ("SOC2_CC4.1",       "Ongoing evaluations of internal controls"),
+    ],
+    "deployer_obligations_review": [
+        ("EUAIA_ART26",      "Deployer obligations — oversight, logs, worker notification"),
+        ("EUAIA_ART14",      "Human oversight measures implemented by deployer"),
+        ("ISO42001_A.9.2",   "Responsible use of AI systems"),
+        ("NISTAI_GOVERN5.1", "Organizational teams document AI oversight"),
+    ],
 }
 
 
@@ -1233,6 +1245,18 @@ def _cmd_push(args: List[str]) -> None:
         governance_review  --reviewed-by IDENTITY --report-type TYPE
                            --frameworks FW1,FW2 --overall-readiness 0-100
                            [--action-items N] [--review-date ISO8601]
+
+        quality_management_review  --reviewed-by EMAIL --procedures-version VER
+                                   [--scope TEXT] [--action-items N]
+                                   [--notes TEXT] [--review-date ISO8601]
+                                   Earns: EUAIA_ART17, ISO42001_A.6.1/A.6.3
+
+        deployer_obligations_review  --reviewed-by EMAIL --system-name NAME
+                                     --human-oversight-implemented true|false
+                                     [--workers-informed true|false]
+                                     [--input-data-quality-verified true|false]
+                                     [--notes TEXT] [--review-date ISO8601]
+                                     Earns: EUAIA_ART26, EUAIA_ART14, ISO42001_A.9.2
     """
     if not args or args[0] in ("-h", "--help"):
         print(textwrap.dedent(_cmd_push.__doc__ or ""))
@@ -1304,6 +1328,7 @@ def _cmd_push(args: List[str]) -> None:
             "policy_acknowledged", "incident_report",
             "ai_risk_assessment", "training_data_governance", "model_evaluation",
             "human_oversight", "model_drift_event", "governance_review",
+            "quality_management_review", "deployer_obligations_review",
         )
         if record_type not in valid_types:
             print(
@@ -1713,6 +1738,40 @@ def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
         if flags.get("notes"):
             gr_payload["notes"] = flags["notes"]
         p = {"payload": gr_payload, "identity": flags["reviewed_by"]}
+        if flags.get("review_date"):
+            p["occurred_at"] = flags["review_date"]
+        return p
+
+    if record_type == "quality_management_review":
+        if not require("reviewed_by", "procedures_version"):
+            return None
+        qmr_payload: dict = {
+            "reviewed_by":        flags["reviewed_by"],
+            "procedures_version": flags["procedures_version"],
+            "scope":              flags.get("scope", "design_development_testing_monitoring"),
+            "action_items":       int(flags.get("action_items", "0")),
+        }
+        if flags.get("notes"):
+            qmr_payload["notes"] = flags["notes"]
+        p = {"payload": qmr_payload, "identity": flags["reviewed_by"]}
+        if flags.get("review_date"):
+            p["occurred_at"] = flags["review_date"]
+        return p
+
+    if record_type == "deployer_obligations_review":
+        if not require("reviewed_by", "system_name", "human_oversight_implemented"):
+            return None
+        hoi = flags["human_oversight_implemented"].lower() in ("true", "yes", "1")
+        dor_payload: dict = {
+            "reviewed_by":                  flags["reviewed_by"],
+            "system_name":                  flags["system_name"],
+            "human_oversight_implemented":  hoi,
+            "workers_informed":             flags.get("workers_informed", "").lower() in ("true", "yes", "1"),
+            "input_data_quality_verified":  flags.get("input_data_quality_verified", "").lower() in ("true", "yes", "1"),
+        }
+        if flags.get("notes"):
+            dor_payload["notes"] = flags["notes"]
+        p = {"payload": dor_payload, "identity": flags["reviewed_by"]}
         if flags.get("review_date"):
             p["occurred_at"] = flags["review_date"]
         return p
