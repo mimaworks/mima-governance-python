@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -39,7 +42,12 @@ class _MimaGrcMixin:
     # ── Payload builders ──────────────────────────────────────────────────────
 
     def _build_grc_payload(self, record: GrcRecord) -> dict:
-        """Serialize a GrcRecord into the wire format, dropping None fields."""
+        """Serialize a GrcRecord into the wire format, dropping None fields.
+
+        When signing_key is set, appends an HMAC-SHA256 client signature so
+        auditors can verify the record was created by this SDK instance and
+        was not modified in transit or at rest. Uses stdlib only — no new dep.
+        """
         base = {
             "record_type": record.record_type,
             "payload":     record.payload,
@@ -51,7 +59,29 @@ class _MimaGrcMixin:
             "environment": record.environment,
             "occurred_at": record.occurred_at,
         }
-        return {**base, **{k: v for k, v in optional.items() if v is not None}}
+        wire = {**base, **{k: v for k, v in optional.items() if v is not None}}
+        if self.signing_key:
+            wire["client_sig"]      = self._sign_grc(record, wire)
+            wire["client_sig_algo"] = "hmac-sha256"
+        return wire
+
+    def _sign_grc(self, record: GrcRecord, wire: dict) -> str:
+        """HMAC-SHA256 over the canonical GRC record.
+
+        Canonical message (JSON, sorted keys, no spaces):
+            occurred_at + payload + record_type + system_name + workspace_id
+
+        workspace_id is included to prevent cross-workspace replay attacks.
+        occurred_at is included to prevent timestamp-manipulation attacks.
+        """
+        canonical = json.dumps({
+            "occurred_at":  wire.get("occurred_at", ""),
+            "payload":      record.payload,
+            "record_type":  record.record_type,
+            "system_name":  record.system_name,
+            "workspace_id": self.workspace_id,
+        }, sort_keys=True, separators=(",", ":"))
+        return hmac.new(self.signing_key, canonical.encode(), hashlib.sha256).hexdigest()
 
     def _build_payload(self, record: AttestationRecord) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -197,24 +227,49 @@ class _MimaGrcMixin:
         user: str,
         *,
         version: str,
+        system_name: Optional[str] = None,
+        acknowledgment_type: str = "initial",
+        policy_url: Optional[str] = None,
         channel: str = "in-app",
         session_id: Optional[str] = None,
     ) -> GrcResult:
-        """Record a policy acknowledgment by a user."""
+        """Record a policy acknowledgment by a user.
+
+        Args:
+            policy: Human-readable policy name (e.g. 'AI Use Policy').
+            user: Email of the person acknowledging.
+            version: Policy version being acknowledged (e.g. 'v3.1.0').
+            system_name: AI system this applies to. Defaults to self.system_name.
+            acknowledgment_type: 'initial', 'renewal', or 'update'.
+            policy_url: URL to the versioned policy document.
+            channel: How acknowledgment was collected.
+            session_id: Optional session correlation ID.
+        """
+        valid_types = ("initial", "renewal", "update")
+        if acknowledgment_type not in valid_types:
+            raise ValueError(
+                f"acknowledgment_type must be one of {valid_types}, got '{acknowledgment_type}'"
+            )
+        policy_slug = policy.lower().replace(" ", "-")
+        versioned_resource = f"policy:{policy_slug}:{version}"
+
         payload: Dict[str, Any] = {
-            "policy":  policy,
-            "user":    user,
-            "version": version,
-            "channel": channel,
+            "decision":            "acknowledged",
+            "policy_name":         policy,
+            "policy_version":      version,
+            "acknowledgment_type": acknowledgment_type,
+            "channel":             channel,
         }
+        if policy_url is not None:
+            payload["policy_url"] = policy_url
         if session_id is not None:
             payload["session_id"] = session_id
         record = GrcRecord(
             record_type="policy_acknowledged",
             payload=payload,
-            system_name=self.system_name,
+            system_name=system_name or self.system_name,
             identity=user,
-            resource=policy,
+            resource=versioned_resource,
             occurred_at=datetime.now(timezone.utc).isoformat(),
         )
         return self._push_grc(record)
@@ -258,37 +313,82 @@ class _MimaGrcMixin:
         risk_tier: str,
         use_case: str,
         *,
+        intended_purpose: str,
         impact_domains: list,
         art5_self_assessment: bool,
         assessor: str,
+        annex_iii_category: Optional[str] = None,
         assessment_date: Optional[str] = None,
         technical_doc_url: Optional[str] = None,
+        training_data_url: Optional[str] = None,
+        environment: str = "production",
+        system_version: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> GrcResult:
-        """Record an AI system risk classification and assessment."""
+        """Record an AI system risk classification and assessment (Art. 9).
+
+        Args:
+            system_name: Unique identifier matching mima.attest(system_name=…).
+            risk_tier: 'high', 'limited', or 'minimal' (or 'unacceptable' — prohibited).
+            use_case: Brief use case description (legacy, prefer intended_purpose).
+            intended_purpose: Full Art. IV §1 intended purpose statement.
+            impact_domains: Affected domains (e.g. ['credit', 'consumer_finance']).
+            art5_self_assessment: Certifies no Art. 5 prohibited practices.
+            assessor: Email of the person performing the assessment.
+            annex_iii_category: Required for high-risk systems. One of:
+                biometric_identification, critical_infrastructure, education_vocational,
+                employment_management, essential_services, law_enforcement,
+                migration_border, justice_democratic, not_annex_iii.
+            assessment_date: ISO timestamp. Defaults to now.
+            technical_doc_url: URL to Annex IV technical documentation.
+            training_data_url: URL to training dataset specification.
+            environment: 'production', 'staging', or 'development'.
+            system_version: Version string (e.g. 'v2.1.0').
+            notes: Additional notes.
+        """
         valid_tiers = ("unacceptable", "high", "limited", "minimal")
         if risk_tier not in valid_tiers:
             raise ValueError(
                 f"ai_risk_assessment risk_tier must be one of {valid_tiers}, got '{risk_tier}'"
             )
+        valid_categories = (
+            "biometric_identification", "critical_infrastructure", "education_vocational",
+            "employment_management", "essential_services", "law_enforcement",
+            "migration_border", "justice_democratic", "not_annex_iii",
+        )
+        if risk_tier == "high" and not annex_iii_category:
+            raise ValueError(
+                "annex_iii_category is required for high-risk systems"
+            )
+        if annex_iii_category and annex_iii_category not in valid_categories:
+            raise ValueError(
+                f"annex_iii_category must be one of {valid_categories}, got '{annex_iii_category}'"
+            )
         payload: Dict[str, Any] = {
-            "system_name":         system_name,
-            "risk_tier":           risk_tier,
-            "use_case":            use_case,
+            "risk_level":          risk_tier,
+            "risk_summary":        use_case,
+            "intended_purpose":    intended_purpose,
             "impact_domains":      impact_domains,
             "art5_self_assessment": art5_self_assessment,
-            "assessor":            assessor,
         }
+        if annex_iii_category is not None:
+            payload["annex_iii_category"] = annex_iii_category
+        if system_version is not None:
+            payload["system_version"] = system_version
         if technical_doc_url is not None:
             payload["technical_doc_url"] = technical_doc_url
+        if training_data_url is not None:
+            payload["training_data_url"] = training_data_url
         if notes is not None:
             payload["notes"] = notes
         occurred = assessment_date or datetime.now(timezone.utc).isoformat()
         record = GrcRecord(
             record_type="ai_risk_assessment",
             payload=payload,
-            system_name=self.system_name,
+            system_name=system_name,
+            identity=assessor,
             resource=system_name,
+            environment=environment,
             occurred_at=occurred,
         )
         return self._push_grc(record)

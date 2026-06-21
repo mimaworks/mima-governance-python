@@ -444,7 +444,7 @@ def _print_text(
         lib = unattested[0].library
         print("  How to fix — wrap the call with @mima.attest():\n")
         print("    from mima_governance import MimaGovernance")
-        print("    mima = MimaGovernance(workspace_id=\"...\", api_key=\"...\")\n")
+        print("    mima = MimaGovernance(api_key=\"mima_ext_...\", system_name=\"my-service\")\n")
         print("    @mima.attest(tool_name=\"describe_this_call\")")
         print("    def your_function(...):")
         print(f"        return {lib}.your_call(...)  # ← this call is now evidenced\n")
@@ -1194,7 +1194,9 @@ def _cmd_push(args: List[str]) -> None:
         vendor_risk      --vendor NAME --tier critical|high|medium|low
                          --last-reviewed YYYY-MM-DD [--findings N]
 
-        policy_acknowledged  --policy NAME --user EMAIL --version VER
+        policy_acknowledged  --policy NAME --user EMAIL --version VER --system NAME
+                             [--policy-url URL]
+                             [--acknowledgment-type initial|renewal|update]
                              [--channel in-app|email|slack]
 
         incident_report  --title TEXT --severity critical|high|medium|low
@@ -1202,9 +1204,12 @@ def _cmd_push(args: List[str]) -> None:
                          [--detected-at ISO8601] [--authority-notified-at ISO8601]
 
         ai_risk_assessment  --system NAME --risk-tier unacceptable|high|limited|minimal
-                            --use-case TEXT --impact-domains DOM1,DOM2
+                            --use-case TEXT --intended-purpose TEXT
+                            --impact-domains DOM1,DOM2
                             --art5-self-assessment true|false --assessor EMAIL
-                            [--assessment-date ISO8601] [--technical-doc-url URL]
+                            [--annex-iii-category CATEGORY]
+                            [--version VER] [--assessment-date ISO8601]
+                            [--technical-doc-url URL] [--training-data-url URL]
 
         training_data_governance  --model-id ID --dataset-id ID --record-count N
                                   --bias-checks-performed true|false --approved-by EMAIL
@@ -1476,18 +1481,34 @@ def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
         }
 
     if record_type == "policy_acknowledged":
-        if not require("policy", "user", "version"):
+        if not require("policy", "user", "version", "system"):
             return None
+        valid_ack_types = ("initial", "renewal", "update")
+        ack_type = flags.get("acknowledgment_type", "initial")
+        if ack_type not in valid_ack_types:
+            print(f"mima push: --acknowledgment-type must be one of: {', '.join(valid_ack_types)}",
+                  file=sys.stderr)
+            return None
+        pa_payload: dict = {
+            "decision":            "acknowledged",
+            "policy_name":         flags["policy"],
+            "policy_version":      flags["version"],
+            "acknowledgment_type": ack_type,
+            "channel":             flags.get("channel", "in-app"),
+        }
+        if flags.get("policy_url"):
+            pa_payload["policy_url"] = flags["policy_url"]
+        if flags.get("session_id"):
+            pa_payload["session_id"] = flags["session_id"]
+        # resource encodes versioned policy reference — auditors trace this
+        versioned_resource = (
+            f"policy:{flags['policy'].lower().replace(' ', '-')}:{flags['version']}"
+        )
         return {
-            "payload": {
-                "policy":  flags["policy"],
-                "user":    flags["user"],
-                "version": flags["version"],
-                "channel": flags.get("channel", "in-app"),
-                **({} if not flags.get("session_id") else {"session_id": flags["session_id"]}),
-            },
-            "identity": flags["user"],
-            "resource":  flags["policy"],
+            "payload":     pa_payload,
+            "identity":    flags["user"],
+            "resource":    versioned_resource,
+            "system_name": flags["system"],
         }
 
     if record_type == "incident_report":
@@ -1513,8 +1534,8 @@ def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
         return p
 
     if record_type == "ai_risk_assessment":
-        if not require("system", "risk_tier", "use_case", "impact_domains",
-                       "art5_self_assessment", "assessor"):
+        if not require("system", "risk_tier", "use_case", "intended_purpose",
+                       "impact_domains", "art5_self_assessment", "assessor"):
             return None
         valid_tiers = ("unacceptable", "high", "limited", "minimal")
         if flags["risk_tier"] not in valid_tiers:
@@ -1525,18 +1546,42 @@ def _build_push_payload(record_type: str, flags: dict) -> "dict | None":
         if a5_raw not in ("true", "false", "1", "0", "yes", "no"):
             print("mima push: --art5-self-assessment must be true or false", file=sys.stderr)
             return None
+        valid_annex_categories = (
+            "biometric_identification", "critical_infrastructure", "education_vocational",
+            "employment_management", "essential_services", "law_enforcement",
+            "migration_border", "justice_democratic", "not_annex_iii",
+        )
+        annex_cat = flags.get("annex_iii_category")
+        if annex_cat and annex_cat not in valid_annex_categories:
+            print(
+                f"mima push: --annex-iii-category must be one of: {', '.join(valid_annex_categories)}",
+                file=sys.stderr,
+            )
+            return None
         domains = [d.strip() for d in flags["impact_domains"].split(",") if d.strip()]
         ai_payload: dict = {
             "system_name":          flags["system"],
             "risk_tier":            flags["risk_tier"],
+            "risk_level":           flags["risk_tier"],   # alias for dashboard compat
             "use_case":             flags["use_case"],
+            "intended_purpose":     flags["intended_purpose"],
             "impact_domains":       domains,
             "art5_self_assessment": a5_raw in ("true", "1", "yes"),
             "assessor":             flags["assessor"],
         }
+        if annex_cat:
+            ai_payload["annex_iii_category"] = annex_cat
+        if flags.get("version"):
+            ai_payload["system_version"] = flags["version"]
         if flags.get("technical_doc_url"):
             ai_payload["technical_doc_url"] = flags["technical_doc_url"]
-        p = {"payload": ai_payload, "resource": flags["system"]}
+        if flags.get("training_data_url"):
+            ai_payload["training_data_url"] = flags["training_data_url"]
+        p = {
+            "payload":  ai_payload,
+            "resource": flags["system"],
+            "identity": flags["assessor"],
+        }
         if flags.get("assessment_date"):
             p["occurred_at"] = flags["assessment_date"]
         return p
@@ -1841,6 +1886,28 @@ def _cmd_init(args: List[str]) -> None:
     if libs:
         _prompt_runtime_guard(scan_path, libs, interactive=_interactive, yes_all=yes_all)
 
+    # ── AI system registration prompt ──────────────────────────────────────────
+    # Only prompt when AI calls were detected (a system exists worth registering)
+    # and the user is in interactive mode.
+    if libs and _prompt_yes_no(
+        "Register this system in the governance ledger? (Art. 9 — required for EU AI Act)",
+        default=False,
+        interactive=_interactive,
+        yes_all=False,  # never auto-accept registration — needs real assessor input
+    ):
+        detected_libs = ", ".join(libs)
+        print(f"\n  Run the following to register (fill in your details):\n")
+        print(f"    mima register <system-name> \\")
+        print(f"      --risk <high|medium|low> \\")
+        print(f"      --purpose \"<what this system does and who it affects>\" \\")
+        print(f"      --assessor <your-email>")
+        print(f"\n  Detected libraries: {detected_libs}")
+        print(f"  Example:")
+        print(f"    mima register my-ai-service \\")
+        print(f"      --risk medium \\")
+        print(f"      --purpose \"Summarises customer support tickets for EU users\" \\")
+        print(f"      --assessor dpo@yourcompany.com")
+
     print(f"\n  Next: `mima login` to connect results to your compliance dashboard.\n")
 
 
@@ -1981,6 +2048,24 @@ jobs:
         run: pip install mima-governance
       - name: Run governance tests
         run: mima test {test_file}
+      - name: Push deployment evidence
+        if: github.event_name == 'push' && env.MIMA_API_KEY != ''
+        env:
+          MIMA_API_KEY: ${{{{ secrets.MIMA_API_KEY }}}}
+          MIMA_WORKSPACE_ID: ${{{{ secrets.MIMA_WORKSPACE_ID }}}}
+        run: |
+          mima push change_event \\
+            --by "github-actions" \\
+            --description "Deploy ${{{{ github.sha }}}} to ${{{{ github.ref_name }}}}" \\
+            --environment "production" \\
+            --system "${{{{ github.repository }}}}" \\
+            --change-id "${{{{ github.sha }}}}"
+      - name: Check governance gates
+        if: env.MIMA_API_KEY != ''
+        env:
+          MIMA_API_KEY: ${{{{ secrets.MIMA_API_KEY }}}}
+          MIMA_WORKSPACE_ID: ${{{{ secrets.MIMA_WORKSPACE_ID }}}}
+        run: mima gates check
 """
 
 
@@ -2029,6 +2114,11 @@ def _write_github_action(test_file: str) -> None:
     wf_path.write_text(_GITHUB_ACTION_TEMPLATE.format(test_file=test_file))
     print(f"\n  GitHub Actions workflow written: {wf_path}")
     print(f"  Runs `mima test {test_file}` on every push and pull request.\n")
+    print(f"  Add secrets to your repo:")
+    print(f"    MIMA_API_KEY      — from mima governance dashboard → API keys")
+    print(f"    MIMA_WORKSPACE_ID — your workspace UUID")
+    print(f"  Gates only enforce when secrets are set. Run `mima gates set eu_ai_act required`")
+    print(f"  to configure thresholds.\n")
 
 
 def _cmd_guard(args: List[str]) -> None:
@@ -2333,6 +2423,346 @@ def _cmd_approvals(args: List[str]) -> None:
     _approvals_run(args)
 
 
+def _cmd_register(args: List[str]) -> None:
+    """mima register — register an AI system in the governance ledger (Art. 9).
+
+    Usage:
+        mima register <system_name> --risk high --purpose "..." --assessor you@co.com
+        mima register loan-scoring-v2 --risk high --annex-iii essential_services \\
+            --purpose "Scores loan applications for EU consumers" --assessor dpo@co.com
+    """
+    import textwrap as _tw
+    import json as _json
+    import os as _os
+    import httpx as _httpx
+    from . import config as _config
+
+    if args and args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima register — register an AI system in the governance ledger
+
+            Usage:
+                mima register <system_name> [options]
+
+            Required:
+                <system_name>               Unique system identifier (matches mima.attest(system_name=…))
+                --risk <high|medium|low>    EU AI Act risk tier
+                --purpose "<text>"          Intended purpose statement (Art. IV §1)
+                --assessor <email>          Person performing the assessment (Art. 14)
+
+            Optional:
+                --annex-iii <category>      Required for --risk high. One of:
+                                            biometric_identification, critical_infrastructure,
+                                            education_vocational, employment_management,
+                                            essential_services, law_enforcement,
+                                            migration_border, justice_democratic
+                --summary "<text>"          Risk classification rationale
+                --version <ver>             System version (e.g. v2.1.0)
+                --environment <env>         production (default), staging, development
+                --technical-doc-url <url>   URL to Annex IV documentation
+                --training-data-url <url>   URL to training data specification
+                --no-art5                   Do NOT certify Art. 5 compliance (blocks registration)
+                --json                      Emit raw JSON response
+
+            Examples:
+                mima register loan-scorer --risk high --annex-iii essential_services \\
+                    --purpose "Scores loan applications for EU consumers aged 18-75" \\
+                    --assessor dpo@company.com
+
+                mima register chatbot-support --risk low \\
+                    --purpose "Customer FAQ chatbot, no decisions, EU users" \\
+                    --assessor eng@company.com
+        """))
+        return
+
+    if not args:
+        print("mima register: system_name is required. Run `mima register --help`.", file=sys.stderr)
+        sys.exit(1)
+
+    system_name = args[0]
+    risk_level = None
+    purpose = None
+    assessor = None
+    annex_iii = None
+    summary = None
+    version = None
+    environment = "production"
+    technical_doc_url = None
+    training_data_url = None
+    art5 = True
+    emit_json = False
+
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--risk" and i + 1 < len(args):
+            risk_level = args[i + 1]; i += 2
+        elif a == "--purpose" and i + 1 < len(args):
+            purpose = args[i + 1]; i += 2
+        elif a == "--assessor" and i + 1 < len(args):
+            assessor = args[i + 1]; i += 2
+        elif a == "--annex-iii" and i + 1 < len(args):
+            annex_iii = args[i + 1]; i += 2
+        elif a == "--summary" and i + 1 < len(args):
+            summary = args[i + 1]; i += 2
+        elif a == "--version" and i + 1 < len(args):
+            version = args[i + 1]; i += 2
+        elif a == "--environment" and i + 1 < len(args):
+            environment = args[i + 1]; i += 2
+        elif a == "--technical-doc-url" and i + 1 < len(args):
+            technical_doc_url = args[i + 1]; i += 2
+        elif a == "--training-data-url" and i + 1 < len(args):
+            training_data_url = args[i + 1]; i += 2
+        elif a == "--no-art5":
+            art5 = False; i += 1
+        elif a == "--json":
+            emit_json = True; i += 1
+        else:
+            print(f"mima register: unknown flag '{a}'", file=sys.stderr)
+            sys.exit(1)
+
+    # Validate required fields
+    missing = []
+    if not risk_level: missing.append("--risk")
+    if not purpose: missing.append("--purpose")
+    if not assessor: missing.append("--assessor")
+    if missing:
+        print(f"mima register: missing required flags: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    if risk_level not in ("high", "medium", "low"):
+        print(f"mima register: --risk must be high, medium, or low (got '{risk_level}')", file=sys.stderr)
+        sys.exit(1)
+
+    if risk_level == "high" and not annex_iii:
+        print("mima register: --annex-iii is required for high-risk systems.", file=sys.stderr)
+        sys.exit(1)
+
+    if not art5:
+        print("mima register: Art. 5 self-assessment is required. Systems that cannot certify "
+              "Art. 5 compliance are prohibited under the EU AI Act.", file=sys.stderr)
+        sys.exit(1)
+
+    api_key      = _os.environ.get("MIMA_API_KEY") or _config.get_api_key()
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = _os.environ.get("MIMA_API_URL", "https://governance.mima.ai/api")
+
+    if not api_key or not workspace_id:
+        print("mima register: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
+        sys.exit(1)
+
+    from datetime import datetime, timezone
+    payload: dict = {
+        "risk_level":          risk_level,
+        "risk_summary":        summary or f"Classified as {risk_level}-risk: {purpose[:100]}",
+        "intended_purpose":    purpose,
+        "art5_self_assessment": art5,
+    }
+    if annex_iii:    payload["annex_iii_category"] = annex_iii
+    if version:      payload["system_version"] = version
+    if technical_doc_url:  payload["technical_doc_url"] = technical_doc_url
+    if training_data_url:  payload["training_data_url"] = training_data_url
+
+    body = {
+        "record_type":  "ai_risk_assessment",
+        "system_name":  system_name,
+        "identity":     assessor,
+        "environment":  environment,
+        "occurred_at":  datetime.now(timezone.utc).isoformat(),
+        "payload":      payload,
+    }
+
+    try:
+        resp = _httpx.post(
+            f"{base_url}/workspaces/{workspace_id}/governance/grc/evidence",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            json=body,
+            timeout=15.0,
+        )
+    except (_httpx.ConnectError, _httpx.TimeoutException) as e:
+        print(f"mima register: connection failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code == 401:
+        print("mima register: invalid API key.", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code not in (200, 201):
+        print(f"mima register: API error ({resp.status_code}): {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+
+    if emit_json:
+        print(_json.dumps(data, indent=2))
+        return
+
+    print(f"\n  ✓ AI system \"{system_name}\" registered successfully.\n")
+    print(f"  Record ID:          {data.get('record_id', 'n/a')}")
+    print(f"  Risk level:         {risk_level}{f' — Annex III: {annex_iii}' if annex_iii else ''}")
+    print(f"  Responsible person: {assessor}")
+    controls = data.get("mapped_controls", [])
+    if controls:
+        print(f"  Controls earned:    {', '.join(controls)}")
+    print(f"\n  Next: ensure developers call mima.attest(system_name=\"{system_name}\", ...)")
+    print(f"  so runtime evidence flows into the same ledger.\n")
+
+
+def _cmd_acknowledge(args: List[str]) -> None:
+    """mima acknowledge — record a policy acknowledgment (Art. 9 / SOC 2 CC1.4).
+
+    Usage:
+        mima acknowledge --person you@co.com --policy "AI Use Policy" --version v2.0 --system chatbot
+    """
+    import textwrap as _tw
+    import json as _json
+    import os as _os
+    import httpx as _httpx
+    from . import config as _config
+
+    if args and args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima acknowledge — record a policy acknowledgment
+
+            Usage:
+                mima acknowledge [options]
+
+            Required:
+                --person <email>          Person acknowledging the policy
+                --policy "<name>"         Policy name (e.g. 'AI Use Policy')
+                --version <ver>           Policy version (e.g. 'v2.0' or '2026-06-01')
+                --system <name>           AI system this acknowledgment applies to
+
+            Optional:
+                --type <initial|renewal|update>   Acknowledgment type (default: initial)
+                --url <policy_url>                URL to the versioned policy document
+                --json                            Emit raw JSON response
+
+            Examples:
+                mima acknowledge --person alice@co.com --policy "AI Use Policy" \\
+                    --version v3.1.0 --system loan-scorer
+
+                mima acknowledge --person bob@co.com --policy "Model Risk Policy" \\
+                    --version 2026-06-01 --system chatbot --type renewal
+        """))
+        return
+
+    person = None
+    policy_name = None
+    policy_version = None
+    system_name = None
+    ack_type = "initial"
+    policy_url = None
+    emit_json = False
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--person" and i + 1 < len(args):
+            person = args[i + 1]; i += 2
+        elif a == "--policy" and i + 1 < len(args):
+            policy_name = args[i + 1]; i += 2
+        elif a == "--version" and i + 1 < len(args):
+            policy_version = args[i + 1]; i += 2
+        elif a == "--system" and i + 1 < len(args):
+            system_name = args[i + 1]; i += 2
+        elif a == "--type" and i + 1 < len(args):
+            ack_type = args[i + 1]; i += 2
+        elif a == "--url" and i + 1 < len(args):
+            policy_url = args[i + 1]; i += 2
+        elif a == "--json":
+            emit_json = True; i += 1
+        else:
+            print(f"mima acknowledge: unknown flag '{a}'", file=sys.stderr)
+            sys.exit(1)
+
+    missing = []
+    if not person: missing.append("--person")
+    if not policy_name: missing.append("--policy")
+    if not policy_version: missing.append("--version")
+    if not system_name: missing.append("--system")
+    if missing:
+        print(f"mima acknowledge: missing required flags: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    if "@" not in person:
+        print("mima acknowledge: --person must be a valid email address.", file=sys.stderr)
+        sys.exit(1)
+
+    if ack_type not in ("initial", "renewal", "update"):
+        print(f"mima acknowledge: --type must be initial, renewal, or update (got '{ack_type}')", file=sys.stderr)
+        sys.exit(1)
+
+    api_key      = _os.environ.get("MIMA_API_KEY") or _config.get_api_key()
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = _os.environ.get("MIMA_API_URL", "https://governance.mima.ai/api")
+
+    if not api_key or not workspace_id:
+        print("mima acknowledge: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
+        sys.exit(1)
+
+    from datetime import datetime, timezone
+    policy_slug = policy_name.lower().replace(" ", "-")
+    versioned_resource = f"policy:{policy_slug}:{policy_version}"
+
+    payload: dict = {
+        "decision":            "acknowledged",
+        "policy_name":         policy_name,
+        "policy_version":      policy_version,
+        "acknowledgment_type": ack_type,
+    }
+    if policy_url:
+        payload["policy_url"] = policy_url
+
+    body = {
+        "record_type":  "policy_acknowledged",
+        "system_name":  system_name,
+        "identity":     person,
+        "resource":     versioned_resource,
+        "occurred_at":  datetime.now(timezone.utc).isoformat(),
+        "payload":      payload,
+    }
+
+    try:
+        resp = _httpx.post(
+            f"{base_url}/workspaces/{workspace_id}/governance/grc/evidence",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            json=body,
+            timeout=10.0,
+        )
+    except (_httpx.ConnectError, _httpx.TimeoutException) as e:
+        print(f"mima acknowledge: connection failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code == 401:
+        print("mima acknowledge: invalid API key.", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code not in (200, 201):
+        print(f"mima acknowledge: API error ({resp.status_code}): {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+
+    if emit_json:
+        print(_json.dumps(data, indent=2))
+        return
+
+    print(f"\n  ✓ Policy acknowledgment recorded.\n")
+    print(f"  Person:   {person}")
+    print(f"  Policy:   {policy_name} {policy_version} ({ack_type})")
+    print(f"  System:   {system_name}")
+    print(f"  Record:   {data.get('record_id', 'n/a')}")
+    controls = data.get("mapped_controls", [])
+    if controls:
+        print(f"  Controls: {', '.join(controls)}")
+    print()
+
+
 def _cmd_generate_link(args: List[str]) -> None:
     """mima generate-link — print a dashboard URL that lands Profile A directly in their workspace.
 
@@ -2417,6 +2847,330 @@ def _cmd_generate_link(args: List[str]) -> None:
     print(f"  No account or UUID entry required — the link does it all.\n")
 
 
+def _cmd_audit_pack(args: List[str]) -> None:
+    """mima audit-pack — download the governance audit ZIP for your auditor.
+
+    Usage:
+        mima audit-pack
+        mima audit-pack --out /path/to/pack.zip
+
+    Downloads a ZIP containing:
+        summary.json   — framework readiness scores and overall coverage
+        evidence.csv   — all evidence records (last 12 months)
+        gates.json     — gate configurations and current pass/fail state
+        manifest.json  — SHA-256 of every file + custody statement
+                         (+ HMAC-SHA256 pack_sig if signing is configured)
+
+    Options:
+        --out FILE     Save to FILE instead of ./mima-governance-pack-<date>.zip
+    """
+    import textwrap as _tw
+    import os as _os
+    import httpx as _httpx
+    from datetime import datetime, timezone
+    from . import config as _config
+
+    if args and args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima audit-pack — download the governance audit ZIP
+
+            Usage:
+                mima audit-pack [--out FILE]
+
+            Options:
+                --out FILE   Write ZIP to FILE (default: mima-governance-pack-YYYY-MM-DD.zip)
+
+            The ZIP contains summary.json, evidence.csv, gates.json, and manifest.json
+            with SHA-256 integrity hashes. When GOVERNANCE_SIGNING_SECRET is set on
+            the server the manifest carries an HMAC-SHA256 pack_sig an auditor can verify.
+
+            Example:
+                mima audit-pack --out q3-audit-pack.zip
+        """))
+        return
+
+    api_key      = _os.environ.get("MIMA_API_KEY") or _config.get_api_key()
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = _os.environ.get("MIMA_API_URL", "https://governance.mima.ai/api")
+
+    if not api_key or not workspace_id:
+        print("mima audit-pack: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
+        sys.exit(1)
+
+    out_path: str | None = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--out" and i + 1 < len(args):
+            out_path = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    if not out_path:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        out_path = f"mima-governance-pack-{date_str}.zip"
+
+    print(f"  Generating audit pack for workspace {workspace_id[:8]}…", end=" ", flush=True)
+
+    try:
+        resp = _httpx.get(
+            f"{base_url}/workspaces/{workspace_id}/governance/audit-pack",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=60.0,  # ZIP generation can take a moment for large evidence sets
+        )
+    except (_httpx.ConnectError, _httpx.TimeoutException) as e:
+        print(f"\nmima audit-pack: connection failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"\nmima audit-pack: server returned {resp.status_code}", file=sys.stderr)
+        try:
+            print(f"  {resp.json().get('error', '')}", file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+
+    # Write the ZIP bytes to disk
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+
+    # Surface integrity metadata from response headers
+    bundle_hash  = resp.headers.get("x-bundle-hash", "")
+    record_count = resp.headers.get("x-record-count", "?")
+    pack_sig     = resp.headers.get("x-pack-sig", "")
+
+    print("done")
+    print(f"\n  Saved: {out_path}")
+    print(f"  Records: {record_count}  ·  {len(resp.content):,} bytes")
+    if bundle_hash:
+        print(f"  Bundle hash: {bundle_hash}")
+    if pack_sig:
+        print(f"  Pack signature: {pack_sig}")
+        print(f"  (HMAC-SHA256 — share with auditor for server-side verification)")
+    print(f"\n  Hand {out_path!r} to your auditor.")
+    print(f"  They can verify file integrity using the sha256 fields in manifest.json.\n")
+
+
+def _cmd_posture(args: List[str]) -> None:
+    """mima posture — show the current GRC coverage posture for this workspace.
+
+    Usage:
+        mima posture
+        mima posture --json
+
+    Prints overall coverage %, per-framework scores, failing required gates,
+    and unattested AI call count (last 24 h).  Use this as a pre-flight check
+    before a design review: "what is our current compliance position?"
+
+    Options:
+        --json   Print raw JSON response
+    """
+    import textwrap as _tw
+    import json as _json
+    import os as _os
+    import httpx as _httpx
+    from . import config as _config
+
+    if args and args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima posture — show current GRC coverage posture
+
+            Usage:
+                mima posture [--json]
+
+            Options:
+                --json   Emit raw JSON (machine-readable)
+
+            Examples:
+                mima posture
+                mima posture --json | jq '.overall_pct'
+        """))
+        return
+
+    emit_json = "--json" in args
+
+    api_key      = _os.environ.get("MIMA_API_KEY") or _config.get_api_key()
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = _os.environ.get("MIMA_API_URL", "https://governance.mima.ai/api")
+
+    if not api_key or not workspace_id:
+        print("mima posture: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        resp = _httpx.get(
+            f"{base_url}/workspaces/{workspace_id}/governance/grc/posture-brief",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+    except (_httpx.ConnectError, _httpx.TimeoutException) as e:
+        print(f"mima posture: connection failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"mima posture: server returned {resp.status_code}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+
+    if emit_json:
+        print(_json.dumps(data, indent=2))
+        return
+
+    overall       = data.get("overall_pct", 0)
+    frameworks    = data.get("frameworks", [])
+    failing_gates = data.get("failing_gates", [])
+    unattested    = data.get("unattested_24h", 0)
+
+    # Overall score with colour hint
+    status = "✓" if overall >= 80 else ("△" if overall >= 50 else "✗")
+    print(f"\n  GRC posture — workspace {workspace_id[:8]}…\n")
+    print(f"  {status}  Overall coverage: {overall}%\n")
+
+    if frameworks:
+        print("  Framework coverage:")
+        for fw in frameworks:
+            name  = fw.get("framework", "")
+            score = fw.get("score_pct", 0)
+            bar_filled = round(score / 5)   # 20 chars = 100%
+            bar = "█" * bar_filled + "░" * (20 - bar_filled)
+            flag = "  ← failing gate" if name in failing_gates else ""
+            print(f"    {name:<20} [{bar}] {score:>3}%{flag}")
+        print()
+
+    if failing_gates:
+        print(f"  ✗  Failing required gates: {', '.join(failing_gates)}")
+        print(f"     Run `mima gates check` for details.\n")
+
+    if unattested > 0:
+        print(f"  △  Unattested AI calls (24 h): {unattested:,}")
+        print(f"     Run `mima guard status` to see which call sites need coverage.\n")
+    else:
+        print(f"  ✓  No unattested AI calls in the last 24 h.\n")
+
+    if overall >= 80 and not failing_gates:
+        print("  All gates passing. Posture is healthy.\n")
+    elif not failing_gates:
+        print("  No required gates failing — but coverage below 80%.")
+        print("  Run `mima derive-controls \"<your next feature>\"` before shipping.\n")
+
+
+def _cmd_derive_controls(args: List[str]) -> None:
+    """mima derive-controls — suggest SDK controls for a proposed AI action.
+
+    Usage:
+        mima derive-controls "description of the action"
+        mima derive-controls "loan approval decision" --json
+
+    Returns suggested SDK calls (mima.human_oversight / mima.attest) that cover
+    the EU AI Act controls triggered by the described action.  Use this during
+    design review to catch missing governance evidence before shipping.
+
+    Options:
+        --json   Print raw JSON response from the API
+    """
+    import textwrap as _tw
+    import json as _json
+
+    if not args or args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima derive-controls — suggest governance controls for a proposed AI action
+
+            Usage:
+                mima derive-controls "describe what the AI does"
+                mima derive-controls "fraud scorer that blocks transactions" --json
+
+            Options:
+                --json   Emit raw JSON (machine-readable, suitable for CI scripts)
+
+            Examples:
+                mima derive-controls "credit scoring model that approves or rejects loans"
+                mima derive-controls "recommendation engine for job candidates"
+                mima derive-controls "document summariser for internal knowledge base"
+        """))
+        return
+
+    emit_json = "--json" in args
+    description_parts = [a for a in args if not a.startswith("--")]
+    if not description_parts:
+        print("mima derive-controls: provide a description of the AI action.", file=sys.stderr)
+        sys.exit(1)
+    description = " ".join(description_parts)
+
+    import os as _os
+    import httpx as _httpx
+    from . import config as _config
+
+    api_key      = _os.environ.get("MIMA_API_KEY") or _config.get_api_key()
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = _os.environ.get("MIMA_API_URL", "https://governance.mima.ai/api")
+
+    if not api_key or not workspace_id:
+        print("mima derive-controls: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        resp = _httpx.post(
+            f"{base_url}/workspaces/{workspace_id}/governance/grc/derive-controls",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"action_description": description},
+            timeout=15.0,
+        )
+    except (_httpx.ConnectError, _httpx.TimeoutException) as e:
+        print(f"mima derive-controls: connection failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"mima derive-controls: server returned {resp.status_code}", file=sys.stderr)
+        try:
+            print(f"  {resp.json().get('error', resp.text)}", file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+
+    data = resp.json()
+
+    if emit_json:
+        print(_json.dumps(data, indent=2))
+        return
+
+    controls   = data.get("suggested_controls", [])
+    gaps       = data.get("gaps", [])
+    art14      = data.get("art14_applicable", False)
+    reasoning  = data.get("reasoning", "")
+
+    if not controls:
+        print("\n  No matching governance controls found for that description.")
+        print(f"  Try being more specific — e.g. \"credit scoring model\" or \"biometric check\".\n")
+        return
+
+    print(f"\n  Suggested controls for: {description!r}\n")
+    if art14:
+        print("  ⚑  Art. 14 (EU AI Act) — human oversight required for this domain\n")
+
+    for c in controls:
+        label   = c.get("label", c.get("control_id", ""))
+        snippet = c.get("sdk_snippet", "")
+        fws     = ", ".join(c.get("frameworks", []))
+        print(f"  {label}")
+        if fws:
+            print(f"    Frameworks: {fws}")
+        if snippet:
+            print(f"    SDK call:")
+            for line in snippet.splitlines():
+                print(f"      {line}")
+        print()
+
+    if gaps:
+        print(f"  Gaps (not yet covered in this workspace):")
+        for g in gaps:
+            print(f"    · {g}")
+        print()
+
+    if reasoning:
+        print(f"  Reasoning: {reasoning}\n")
+
+
 _COMMANDS = {
     "scan":      _cmd_scan,
     "init":      _cmd_init,
@@ -2427,9 +3181,14 @@ _COMMANDS = {
     "guard":     _cmd_guard,
     "policy":    _cmd_policy,
     "gates":     _cmd_gates,
-    "webhooks":       _cmd_webhooks,
-    "approvals":      _cmd_approvals,
-    "generate-link":  _cmd_generate_link,
+    "webhooks":         _cmd_webhooks,
+    "approvals":        _cmd_approvals,
+    "register":         _cmd_register,
+    "acknowledge":      _cmd_acknowledge,
+    "generate-link":    _cmd_generate_link,
+    "audit-pack":       _cmd_audit_pack,
+    "posture":          _cmd_posture,
+    "derive-controls":  _cmd_derive_controls,
 }
 
 
@@ -2453,7 +3212,12 @@ def main() -> None:
                 mima gates check|set|unset      Configure and enforce CI governance gates
                 mima webhooks list|register     Manage governance event webhook endpoints
                 mima approvals list|decide      List and action human-approval requests
+                mima register <system>          Register an AI system in the governance ledger (Art. 9)
+                mima acknowledge                Record a policy acknowledgment (Art. 9 / SOC 2 CC1.4)
                 mima generate-link              Generate a shareable dashboard URL for a GRC manager
+                mima posture                    Show current GRC coverage posture
+                mima derive-controls <action>   Derive applicable controls for an AI action
+                mima audit-pack                 Download a GRC evidence ZIP for auditors
 
             Run `mima <command> --help` for command-specific options.
 
