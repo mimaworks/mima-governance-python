@@ -6,12 +6,14 @@ Attest AI executions, push GRC evidence records, and run governance policy tests
 
 | Framework | What it covers |
 |---|---|
-| EU AI Act | Art. 9 risk assessments, Art. 13 transparency, Art. 14 human oversight, Art. 15 accuracy |
+| EU AI Act | Art. 9–15 (risk management through accuracy), Art. 17 (quality management system), Art. 26 (deployer obligations), Art. 72–73 (post-market monitoring, incident reporting) |
 | ISO 42001 | AI management system controls — A.6.x risk treatment, A.9.x performance evaluation |
-| SOC 2 | CC3.x risk assessment, CC5.x control activities, CC7.x change management |
+| SOC 2 | CC3.x risk assessment, CC5.x control activities, CC7.x–CC8.x change and incident management |
 | NIST AI RMF | GOVERN, MAP, MEASURE, MANAGE functions |
 
-One `@mima.attest()` call earns controls across whichever frameworks apply — no per-regulation wiring, no separate pipelines. `human_oversight` earns `EUAIA_ART14`, `EUAIA_ART13`, `ISO42001_A.6.6`, and `NIST_GOV1` in a single write. Your readiness score updates across all four.
+One `@mima.attest()` call earns controls across whichever frameworks apply — no per-regulation wiring, no separate pipelines. `human_oversight` earns `EUAIA_ART14`, `EUAIA_ART13`, `ISO42001_A.6.6`, and `NIST_AIRF_GOV_1` in a single write. Your readiness score updates across all four.
+
+**What mima does not cover:** EU AI Act Art. 1–5 (scope and prohibited practices — legal determinations), Art. 51–56 (GPAI obligations — foundation model providers only, not application builders), and Art. 57–101 (regulatory apparatus, conformity assessment, EU database registration). Those require lawyers, structural decisions, or third-party conformity bodies — not SDK calls. mima covers the articles that require *technical evidence from code*.
 
 ## No account needed to start
 
