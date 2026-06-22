@@ -3115,42 +3115,67 @@ def _cmd_posture(args: List[str]) -> None:
 
 
 def _cmd_derive_controls(args: List[str]) -> None:
-    """mima derive-controls — suggest SDK controls for a proposed AI action.
+    """mima derive-controls — show coverage gaps for a described AI action.
 
     Usage:
         mima derive-controls "description of the action"
-        mima derive-controls "loan approval decision" --json
+        mima derive-controls "loan approval decision" --system loan-scorer
+        mima derive-controls "autonomous fraud blocking" --tier high --json
 
-    Returns suggested SDK calls (mima.human_oversight / mima.attest) that cover
-    the EU AI Act controls triggered by the described action.  Use this during
-    design review to catch missing governance evidence before shipping.
+    Returns coverage gaps from the governance ledger so you (or Claude) can
+    reason about which evidence records the described action requires.
+    No keyword classification — data only. Use /mima:close-gaps in Claude Code
+    for specific recommendations with dry-run confirmation.
 
     Options:
-        --json   Print raw JSON response from the API
+        --system NAME   Resolve risk tier and Art. 14 status for a registered system
+        --tier TIER     Assert risk tier when system is not yet registered (high/limited/minimal)
+        --json          Print raw JSON response from the API
     """
     import textwrap as _tw
     import json as _json
 
     if not args or args[0] in ("-h", "--help"):
         print(_tw.dedent("""\
-            mima derive-controls — suggest governance controls for a proposed AI action
+            mima derive-controls — show coverage gaps for a described AI action
 
             Usage:
                 mima derive-controls "describe what the AI does"
-                mima derive-controls "fraud scorer that blocks transactions" --json
+                mima derive-controls "fraud scorer that blocks transactions" --system fraud-v2
+                mima derive-controls "loan approval model" --tier high --json
 
             Options:
-                --json   Emit raw JSON (machine-readable, suitable for CI scripts)
+                --system NAME   Resolve risk tier from registered system
+                --tier TIER     Assert risk tier (high/limited/minimal) — cold-start
+                --json          Emit raw JSON (machine-readable)
 
             Examples:
                 mima derive-controls "credit scoring model that approves or rejects loans"
-                mima derive-controls "recommendation engine for job candidates"
                 mima derive-controls "document summariser for internal knowledge base"
+                mima derive-controls "autonomous agent that freezes accounts" --tier high
         """))
         return
 
     emit_json = "--json" in args
-    description_parts = [a for a in args if not a.startswith("--")]
+
+    # Parse --system and --tier flags
+    system_name: Optional[str] = None
+    ai_risk_tier: Optional[str] = None
+    description_parts: List[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--system" and i + 1 < len(args):
+            system_name = args[i + 1]
+            i += 2
+        elif args[i] == "--tier" and i + 1 < len(args):
+            ai_risk_tier = args[i + 1]
+            i += 2
+        elif args[i] == "--json":
+            i += 1
+        else:
+            description_parts.append(args[i])
+            i += 1
+
     if not description_parts:
         print("mima derive-controls: provide a description of the AI action.", file=sys.stderr)
         sys.exit(1)
@@ -3168,11 +3193,17 @@ def _cmd_derive_controls(args: List[str]) -> None:
         print("mima derive-controls: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
         sys.exit(1)
 
+    payload: dict = {"action_description": description}
+    if system_name:
+        payload["system_name"] = system_name
+    if ai_risk_tier:
+        payload["ai_risk_tier"] = ai_risk_tier
+
     try:
         resp = _httpx.post(
             f"{base_url}/workspaces/{workspace_id}/governance/grc/derive-controls",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={"action_description": description},
+            json=payload,
             timeout=15.0,
         )
     except (_httpx.ConnectError, _httpx.TimeoutException) as e:
@@ -3193,41 +3224,56 @@ def _cmd_derive_controls(args: List[str]) -> None:
         print(_json.dumps(data, indent=2))
         return
 
-    controls   = data.get("suggested_controls", [])
-    gaps       = data.get("gaps", [])
-    art14      = data.get("art14_applicable", False)
-    reasoning  = data.get("reasoning", "")
+    uncovered    = data.get("uncovered_required_controls", [])
+    total_req    = data.get("total_required", 0)
+    total_cov    = data.get("total_covered", 0)
+    tier         = data.get("system_risk_tier")
+    category     = data.get("annex_iii_category")
+    art14        = data.get("art14_applicable")  # bool | None
 
-    if not controls:
-        print("\n  No matching governance controls found for that description.")
-        print(f"  Try being more specific — e.g. \"credit scoring model\" or \"biometric check\".\n")
-        return
+    print(f"\n  Coverage gaps for your workspace ({total_req - total_cov} of {total_req} controls uncovered)\n")
 
-    print(f"\n  Suggested controls for: {description!r}\n")
-    if art14:
-        print("  ⚑  Art. 14 (EU AI Act) — human oversight required for this domain\n")
-
-    for c in controls:
-        label   = c.get("label", c.get("control_id", ""))
-        snippet = c.get("sdk_snippet", "")
-        fws     = ", ".join(c.get("frameworks", []))
-        print(f"  {label}")
-        if fws:
-            print(f"    Frameworks: {fws}")
-        if snippet:
-            print(f"    SDK call:")
-            for line in snippet.splitlines():
-                print(f"      {line}")
+    if uncovered:
+        print("  Controls with no evidence that may apply to this action:")
+        shown = uncovered[:8]
+        for ctrl in shown:
+            control_id  = ctrl.get("control_id", "")
+            framework   = ctrl.get("framework", "")
+            record_types = ctrl.get("record_types", [])
+            rts = ", ".join(record_types) if record_types else "—"
+            print(f"    {control_id:<24}  {rts:<32}  ({framework})")
+        remaining = len(uncovered) - len(shown)
+        if remaining > 0:
+            print(f"    ... and {remaining} more uncovered controls")
         print()
 
-    if gaps:
-        print(f"  Gaps (not yet covered in this workspace):")
-        for g in gaps:
-            print(f"    · {g}")
-        print()
+    # System / Art. 14 status
+    if tier:
+        cat_str = f"  Annex III: {category}" if category else ""
+        print(f"  System: {system_name or '(unnamed)'} — {tier.upper()}-RISK{cat_str}")
+        if art14 is True:
+            print("  Art. 14: REQUIRED — human oversight evidence needed")
+        elif art14 is False:
+            print(f"  Art. 14: not required ({tier} risk)")
+        else:
+            print("  Art. 14: unknown — register Annex III category to determine")
+            print(f"  → mima push ai_risk_assessment --system {system_name or '<name>'} --annex-iii-category <category>")
+    else:
+        sys_str = f"  System: {system_name}" if system_name else "  System: not specified (pass --system NAME for registered risk tier)"
+        print(sys_str)
+        if art14 is True:
+            print("  Art. 14: REQUIRED (asserted via --tier high)")
+        elif art14 is False:
+            print("  Art. 14: not required (asserted via --tier)")
+        else:
+            print("  Art. 14 status: unknown")
+            print("  → Pass --system NAME for a registered system, or --tier high to assert")
 
-    if reasoning:
-        print(f"  Reasoning: {reasoning}\n")
+    print()
+    print("  For a full analysis with specific recommendations:")
+    print("    Run /mima:close-gaps in Claude Code (requires governance MCP server)")
+    print("    Or push evidence directly: mima push <record_type> --help")
+    print()
 
 
 _COMMANDS = {
