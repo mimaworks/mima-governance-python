@@ -27,7 +27,8 @@ otel = ["opentelemetry-api>=1.20"]
 langchain = ["langchain-core>=0.1"]
 llamaindex = ["llama-index-core>=0.10"]
 autogen = ["pyautogen>=0.2"]
-dev = ["pytest>=7", "pytest-asyncio>=0.21", "respx>=0.20", "pytest-mock>=3.10"]
+policy = ["pyyaml>=6"]
+dev = ["pytest>=7", "pytest-asyncio>=0.21", "respx>=0.20", "pytest-mock>=3.10", "pyyaml>=6"]
 
 [project.scripts]
 mima = "mima_governance.cli:main"

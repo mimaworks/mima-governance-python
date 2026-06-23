@@ -25,10 +25,11 @@ class MimaGovernance(_MimaGrcMixin):
 
     Usage:
         mima = MimaGovernance(
-            workspace_id="uuid",
             api_key="mima_ext_...",
             system_name="my-ai-pipeline",
         )
+        # workspace_id is resolved automatically from the API key.
+        # Pass workspace_id= explicitly only if you manage multiple workspaces.
 
         @mima.attest(tool_name="generate_report")
         def generate_report(data):
@@ -37,10 +38,10 @@ class MimaGovernance(_MimaGrcMixin):
 
     def __init__(
         self,
-        workspace_id: str,
         api_key: str,
         system_name: str,
         *,
+        workspace_id: Optional[str] = None,
         base_url: str = "https://api.mima.ai",
         agent_name: Optional[str] = None,
         signing_key: Optional[bytes] = None,
@@ -81,6 +82,79 @@ class MimaGovernance(_MimaGrcMixin):
         # so records queued near shutdown can silently vanish with __del__ alone.
         atexit.register(self._flush_batch)
 
+    # ── Workspace ID resolution ───────────────────────────────────────────────
+
+    def _ensure_ws(self) -> str:
+        """Return workspace_id, auto-resolving from the API key if not set."""
+        if not self.workspace_id:
+            self.workspace_id = self._resolve_workspace_id()
+        if not self.workspace_id:
+            raise MimaAttestationError(
+                "workspace_id not set and could not be resolved automatically — "
+                "pass workspace_id=, set MIMA_WORKSPACE_ID, or run `mima login`"
+            )
+        return self.workspace_id
+
+    def _resolve_workspace_id(self) -> Optional[str]:
+        try:
+            resp = self._http.get("/api/me")
+            if resp.status_code == 200:
+                return resp.json().get("workspace_id")
+        except Exception:
+            pass
+        return None
+
+    # ── Pre-approval gate ────────────────────────────────────────────────────
+
+    def require_approval(
+        self,
+        action_type: str,
+        context: dict,
+        *,
+        timeout_seconds: int = 300,
+        approver: Optional[str] = None,
+        on_timeout: str = "raise",
+    ):
+        """Block until a GRC manager approves the action in the Mima dashboard.
+
+        Returns an ApprovalToken on approval, or a TimeoutToken when
+        on_timeout='warn' and the request expires. Raises ApprovalDenied,
+        ApprovalTimeout, or ApprovalCancelled otherwise.
+
+        Pass the returned token to @mima.attest(approval_token=token) to link
+        the evidence record to the approval.
+
+        WARNING: Do not call this inside a web request handler — it will hold
+        the connection for up to timeout_seconds. Gate job submission instead:
+
+            token = mima.require_approval(...)   # blocks here
+            queue.submit(make_decision, token=token)
+        """
+        from .approvals import MimaGovernanceError, poll_approval_sync
+
+        body: Dict[str, Any] = {
+            "action_type": action_type,
+            "context": context,
+            "timeout_seconds": timeout_seconds,
+        }
+        if approver:
+            body["approver_hint"] = approver
+
+        ws = self._ensure_ws()
+        resp = self._http.post(
+            f"/api/workspaces/{ws}/governance/approvals",
+            json=body,
+        )
+        if resp.status_code >= 400:
+            raise MimaGovernanceError(
+                f"Failed to create approval request: HTTP {resp.status_code} — {resp.text}"
+            )
+
+        approval_id = resp.json()["approval_id"]
+        return poll_approval_sync(
+            self._http, ws, approval_id, timeout_seconds, on_timeout
+        )
+
     # ── Decorator: zero-effort attestation ───────────────────────────────────
 
     def attest(
@@ -90,6 +164,7 @@ class MimaGovernance(_MimaGrcMixin):
         mode: str = "sync",
         model_id: Optional[str] = None,
         authorised_by: Optional[AuthorisedBy] = None,
+        approval_token: Any = None,
     ) -> Callable:
         """
         Decorator that automatically attests a function's execution.
@@ -98,12 +173,26 @@ class MimaGovernance(_MimaGrcMixin):
         def classify(doc):
             return model.predict(doc)
 
+        When approval_token is an ApprovalToken, also pushes a human_oversight
+        GRC record with oversight_status='approved', earning EUAIA_ART14.
+        When approval_token is a TimeoutToken, pushes oversight_status='timeout_unblocked'
+        — no EUAIA_ART14 earned.
+
         Args:
             tool_name: Name of the tool/action being executed.
             mode: "sync" (default, immediate push) or "batch" (buffered).
             model_id: LLM model identifier (e.g. "gpt-4o").
             authorised_by: Override the client-level authorised_by.
+            approval_token: ApprovalToken or TimeoutToken from require_approval().
         """
+        from .approvals import ApprovalToken, TimeoutToken
+
+        # Validate token type up-front so misuse raises immediately, not at call time.
+        if approval_token is not None and not isinstance(approval_token, (ApprovalToken, TimeoutToken)):
+            raise TypeError(
+                f"approval_token must be an ApprovalToken or TimeoutToken, "
+                f"got {type(approval_token).__name__}"
+            )
 
         def decorator(fn: Callable) -> Callable:
             @functools.wraps(fn)
@@ -135,11 +224,46 @@ class MimaGovernance(_MimaGrcMixin):
                 else:
                     self._push_sync(record)
 
+                # Approval token: push a human_oversight GRC record.
+                if approval_token is not None:
+                    self._push_approval_oversight(approval_token, tool_name)
+
                 return result
 
             return wrapper
 
         return decorator
+
+    def _push_approval_oversight(self, token: Any, tool_name: str) -> None:
+        """Push a human_oversight GRC record linked to an approval/timeout token."""
+        from .approvals import ApprovalToken, TimeoutToken
+
+        if isinstance(token, ApprovalToken):
+            # Single-use enforcement: mark before the push so a network retry
+            # cannot double-consume the token.
+            token._mark_used()
+            payload: Dict[str, Any] = {
+                "oversight_status": "approved",
+                "approval_id":      token.approval_id,
+                "approved_by":      token.approved_by,
+                "action_type":      token.action_type,
+                "tool_name":        tool_name,
+            }
+        else:  # TimeoutToken
+            payload = {
+                "oversight_status": "timeout_unblocked",
+                "approval_id":      token.approval_id,
+                "action_type":      token.action_type,
+                "tool_name":        tool_name,
+            }
+
+        grc_record = GrcRecord(
+            record_type="human_oversight",
+            payload=payload,
+            system_name=self.system_name,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._push_grc(grc_record)
 
     # ── Explicit push ────────────────────────────────────────────────────────
 
@@ -207,10 +331,11 @@ class MimaGovernance(_MimaGrcMixin):
 
     def _push_sync(self, record: AttestationRecord) -> AttestationResult:
         payload = self._build_payload(record)
+        ws = self._ensure_ws()
 
         try:
             resp = self._http.post(
-                f"/api/workspaces/{self.workspace_id}/governance/attestations/external",
+                f"/api/workspaces/{ws}/governance/attestations/external",
                 json=payload,
             )
 
@@ -219,7 +344,7 @@ class MimaGovernance(_MimaGrcMixin):
                 retry_after = int(resp.headers.get("retry-after", "5"))
                 time.sleep(min(retry_after, 60))
                 resp = self._http.post(
-                    f"/api/workspaces/{self.workspace_id}/governance/attestations/external",
+                    f"/api/workspaces/{ws}/governance/attestations/external",
                     json=payload,
                 )
 
@@ -246,9 +371,10 @@ class MimaGovernance(_MimaGrcMixin):
     def _push_grc(self, record: GrcRecord) -> GrcResult:
         """Push a single GRC evidence record synchronously."""
         payload = self._build_grc_payload(record)
+        ws = self._ensure_ws()
         try:
             resp = self._http.post(
-                f"/api/workspaces/{self.workspace_id}/governance/grc/evidence",
+                f"/api/workspaces/{ws}/governance/grc/evidence",
                 json=payload,
             )
             if resp.status_code >= 400:
@@ -311,9 +437,10 @@ class MimaGovernance(_MimaGrcMixin):
         # Try batch endpoint first (server >= current). Fall back to per-record
         # push on 404 (older server without batch route).
         payloads = [self._build_payload(r) for r in records]
+        ws = self._ensure_ws()
         try:
             resp = self._http.post(
-                f"/api/workspaces/{self.workspace_id}/governance/attestations/batch",
+                f"/api/workspaces/{ws}/governance/attestations/batch",
                 json={"records": payloads},
             )
             if resp.status_code == 404 and "/batch" in str(resp.url):

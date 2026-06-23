@@ -11,6 +11,11 @@ _INTEGRATIONS = {
     "MimaAutoGenMiddleware":  "mima_governance.integrations.autogen_middleware",
 }
 
+# Eval-framework adapters are importable directly from their modules.
+# Canonical import paths:
+#   from mima_governance.integrations.deepeval_adapter import report_to_mima
+#   from mima_governance.integrations.langfuse_adapter import report_to_mima
+
 
 def __getattr__(name: str):
     if name in _INTEGRATIONS:

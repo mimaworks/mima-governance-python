@@ -22,8 +22,9 @@ class AsyncMimaGovernance(_MimaGrcMixin):
 
     Use as a context manager to guarantee flush on exit:
 
-        async with AsyncMimaGovernance(workspace_id=..., api_key=..., system_name=...) as mima:
+        async with AsyncMimaGovernance(api_key=..., system_name=...) as mima:
             await mima.access_review(...)
+        # workspace_id is resolved automatically from the API key.
 
     Or manage the lifecycle explicitly:
 
@@ -36,10 +37,10 @@ class AsyncMimaGovernance(_MimaGrcMixin):
 
     def __init__(
         self,
-        workspace_id: str,
         api_key: str,
         system_name: str,
         *,
+        workspace_id: Optional[str] = None,
         base_url: str = "https://api.mima.ai",
         agent_name: Optional[str] = None,
         signing_key: Optional[bytes] = None,
@@ -73,6 +74,24 @@ class AsyncMimaGovernance(_MimaGrcMixin):
         # asyncio.Lock must be created inside a running loop;
         # create lazily on first use via _get_lock().
         self._batch_lock: Optional[asyncio.Lock] = None
+
+    # ── Workspace ID resolution ────────────────────────────────────────────────
+
+    async def _ensure_ws(self) -> str:
+        """Return workspace_id, auto-resolving from the API key if not set."""
+        if not self.workspace_id:
+            try:
+                resp = await self._http.get("/api/me")
+                if resp.status_code == 200:
+                    self.workspace_id = resp.json().get("workspace_id")
+            except Exception:
+                pass
+        if not self.workspace_id:
+            raise MimaAttestationError(
+                "workspace_id not set and could not be resolved automatically — "
+                "pass workspace_id=, set MIMA_WORKSPACE_ID, or run `mima login`"
+            )
+        return self.workspace_id
 
     # ── Async context manager ─────────────────────────────────────────────────
 
@@ -109,6 +128,46 @@ class AsyncMimaGovernance(_MimaGrcMixin):
         result = await self._push_async(record)
         ctx.record_id = result.attestation_id
 
+    # ── Async pre-approval gate ────────────────────────────────────────────────
+
+    async def require_approval(
+        self,
+        action_type: str,
+        context: dict,
+        *,
+        timeout_seconds: int = 300,
+        approver: Optional[str] = None,
+        on_timeout: str = "raise",
+    ):
+        """Async variant of require_approval — uses asyncio.sleep, never blocks the loop.
+
+        See MimaGovernance.require_approval() for full documentation.
+        """
+        from .approvals import MimaGovernanceError, poll_approval_async
+
+        body: dict = {
+            "action_type": action_type,
+            "context": context,
+            "timeout_seconds": timeout_seconds,
+        }
+        if approver:
+            body["approver_hint"] = approver
+
+        ws = await self._ensure_ws()
+        resp = await self._http.post(
+            f"/api/workspaces/{ws}/governance/approvals",
+            json=body,
+        )
+        if resp.status_code >= 400:
+            raise MimaGovernanceError(
+                f"Failed to create approval request: HTTP {resp.status_code} — {resp.text}"
+            )
+
+        approval_id = resp.json()["approval_id"]
+        return await poll_approval_async(
+            self._http, ws, approval_id, timeout_seconds, on_timeout
+        )
+
     # ── Async decorator ───────────────────────────────────────────────────────
 
     def attest(
@@ -118,6 +177,7 @@ class AsyncMimaGovernance(_MimaGrcMixin):
         mode: str = "sync",
         model_id: Optional[str] = None,
         authorised_by: Optional[AuthorisedBy] = None,
+        approval_token: Any = None,
     ) -> Callable:
         """
         Decorator for async functions only.
@@ -126,8 +186,18 @@ class AsyncMimaGovernance(_MimaGrcMixin):
         async def classify(doc):
             return await model.predict(doc)
 
+        When approval_token is provided, also pushes a human_oversight GRC record.
+        See MimaGovernance.attest() for full documentation on approval_token semantics.
+
         Raises TypeError if applied to a sync function — use MimaGovernance for those.
         """
+        from .approvals import ApprovalToken, TimeoutToken
+
+        if approval_token is not None and not isinstance(approval_token, (ApprovalToken, TimeoutToken)):
+            raise TypeError(
+                f"approval_token must be an ApprovalToken or TimeoutToken, "
+                f"got {type(approval_token).__name__}"
+            )
 
         def decorator(fn: Callable) -> Callable:
             if not asyncio.iscoroutinefunction(fn):
@@ -165,11 +235,45 @@ class AsyncMimaGovernance(_MimaGrcMixin):
                 else:
                     await self._push_async(record)
 
+                if approval_token is not None:
+                    await self._push_approval_oversight_async(approval_token, tool_name)
+
                 return result
 
             return wrapper
 
         return decorator
+
+    async def _push_approval_oversight_async(self, token: Any, tool_name: str) -> None:
+        """Async: push a human_oversight GRC record linked to an approval/timeout token."""
+        from .approvals import ApprovalToken, TimeoutToken
+        from .types import GrcRecord
+
+        if isinstance(token, ApprovalToken):
+            token._mark_used()
+            payload: dict = {
+                "oversight_status": "approved",
+                "approval_id":      token.approval_id,
+                "approved_by":      token.approved_by,
+                "action_type":      token.action_type,
+                "tool_name":        tool_name,
+            }
+        else:  # TimeoutToken
+            payload = {
+                "oversight_status": "timeout_unblocked",
+                "approval_id":      token.approval_id,
+                "action_type":      token.action_type,
+                "tool_name":        tool_name,
+            }
+
+        from datetime import datetime, timezone
+        grc_record = GrcRecord(
+            record_type="human_oversight",
+            payload=payload,
+            system_name=self.system_name,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await self._push_grc(grc_record)
 
     # ── Explicit push ─────────────────────────────────────────────────────────
 
@@ -197,16 +301,17 @@ class AsyncMimaGovernance(_MimaGrcMixin):
 
     async def _push_async(self, record: AttestationRecord) -> AttestationResult:
         payload = self._build_payload(record)
+        ws = await self._ensure_ws()
         try:
             resp = await self._http.post(
-                f"/api/workspaces/{self.workspace_id}/governance/attestations/external",
+                f"/api/workspaces/{ws}/governance/attestations/external",
                 json=payload,
             )
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("retry-after", "5"))
                 await asyncio.sleep(min(retry_after, 60))
                 resp = await self._http.post(
-                    f"/api/workspaces/{self.workspace_id}/governance/attestations/external",
+                    f"/api/workspaces/{ws}/governance/attestations/external",
                     json=payload,
                 )
             if resp.status_code >= 400:
@@ -230,9 +335,10 @@ class AsyncMimaGovernance(_MimaGrcMixin):
     async def _push_grc(self, record: GrcRecord) -> GrcResult:
         """Push a GRC evidence record asynchronously."""
         payload = self._build_grc_payload(record)
+        ws = await self._ensure_ws()
         try:
             resp = await self._http.post(
-                f"/api/workspaces/{self.workspace_id}/governance/grc/evidence",
+                f"/api/workspaces/{ws}/governance/grc/evidence",
                 json=payload,
             )
             if resp.status_code >= 400:
@@ -282,9 +388,10 @@ class AsyncMimaGovernance(_MimaGrcMixin):
         if not records:
             return
         payloads = [self._build_payload(r) for r in records]
+        ws = await self._ensure_ws()
         try:
             resp = await self._http.post(
-                f"/api/workspaces/{self.workspace_id}/governance/attestations/batch",
+                f"/api/workspaces/{ws}/governance/attestations/batch",
                 json={"records": payloads},
             )
             if resp.status_code == 404 and "/batch" in str(resp.url):
