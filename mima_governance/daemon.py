@@ -202,6 +202,9 @@ class GuardDaemon:
             try:
                 os.chdir(str(self._sock_path.parent))
                 srv.bind(self._sock_path.name)
+                # Restrict socket to owner-only — prevents other local users from
+                # injecting fake attestation events or reading guard traffic.
+                os.chmod(self._sock_path.name, 0o600)
             finally:
                 os.chdir(old_cwd)
             srv.listen(128)
