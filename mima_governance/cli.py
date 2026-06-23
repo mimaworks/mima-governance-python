@@ -3114,6 +3114,84 @@ def _cmd_posture(args: List[str]) -> None:
         print("  Run `mima derive-controls \"<your next feature>\"` before shipping.\n")
 
 
+def _cmd_list_systems(args: List[str]) -> None:
+    """mima list-systems — list AI systems with evidence in this workspace.
+
+    Usage:
+        mima list-systems
+        mima list-systems --json
+    """
+    import textwrap as _tw
+    import json as _json
+    import os as _os
+    import httpx as _httpx
+    from . import config as _config
+
+    if args and args[0] in ("-h", "--help"):
+        print(_tw.dedent("""\
+            mima list-systems — list AI systems registered in this workspace
+
+            Usage:
+                mima list-systems [--json]
+
+            Options:
+                --json   Emit raw JSON (machine-readable)
+
+            Examples:
+                mima list-systems
+                mima list-systems --json | jq '.[].system_name'
+        """))
+        return
+
+    emit_json = "--json" in args
+
+    api_key      = _os.environ.get("MIMA_API_KEY") or _config.get_api_key()
+    workspace_id = _os.environ.get("MIMA_WORKSPACE_ID") or _config.get_workspace_id()
+    base_url     = _os.environ.get("MIMA_API_URL", "https://governance.mima.ai/api")
+
+    if not api_key or not workspace_id:
+        print("mima list-systems: MIMA_API_KEY and MIMA_WORKSPACE_ID are required.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        resp = _httpx.get(
+            f"{base_url}/workspaces/{workspace_id}/governance/grc/systems",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+    except (_httpx.ConnectError, _httpx.TimeoutException) as e:
+        print(f"mima list-systems: connection failed — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"mima list-systems: server returned {resp.status_code}", file=sys.stderr)
+        sys.exit(1)
+
+    data = resp.json()
+
+    if emit_json:
+        print(_json.dumps(data, indent=2))
+        return
+
+    systems = data if isinstance(data, list) else data.get("systems", [])
+    if not systems:
+        print("\n  No AI systems found in this workspace.")
+        print("  Run `mima scan .` to detect AI call sites, or `mima push ai_risk_assessment` to register a system.\n")
+        return
+
+    print(f"\n  AI systems — workspace {workspace_id[:8]}…\n")
+    print(f"  {'System':<30}  {'Records':>7}  {'Status':<12}")
+    print(f"  {'─' * 30}  {'─' * 7}  {'─' * 12}")
+    for s in systems:
+        name     = s.get("system_name", "")
+        count    = s.get("record_count", 0)
+        registered = s.get("registered", False)
+        status   = "registered" if registered else "unregistered"
+        flag     = "  ← needs Art. 9" if not registered else ""
+        print(f"  {name:<30}  {count:>7}  {status:<12}{flag}")
+    print()
+
+
 def _cmd_derive_controls(args: List[str]) -> None:
     """mima derive-controls — show coverage gaps for a described AI action.
 
@@ -3293,6 +3371,7 @@ _COMMANDS = {
     "generate-link":    _cmd_generate_link,
     "audit-pack":       _cmd_audit_pack,
     "posture":          _cmd_posture,
+    "list-systems":     _cmd_list_systems,
     "derive-controls":  _cmd_derive_controls,
 }
 
@@ -3321,6 +3400,7 @@ def main() -> None:
                 mima acknowledge                Record a policy acknowledgment (Art. 9 / SOC 2 CC1.4)
                 mima generate-link              Generate a shareable dashboard URL for a GRC manager
                 mima posture                    Show current GRC coverage posture
+                mima list-systems               List AI systems with evidence in this workspace
                 mima derive-controls <action>   Derive applicable controls for an AI action
                 mima audit-pack                 Download a GRC evidence ZIP for auditors
 
