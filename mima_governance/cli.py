@@ -791,7 +791,8 @@ def _cmd_status(args: List[str]) -> None:
     import os
     api_key      = os.environ.get("MIMA_API_KEY")      or config.get_api_key()
     workspace_id = os.environ.get("MIMA_WORKSPACE_ID") or config.get_workspace_id()
-    base_url     = os.environ.get("MIMA_BASE_URL")     or config.get_base_url()
+    _raw_url = os.environ.get("MIMA_BASE_URL") or os.environ.get("MIMA_API_URL") or config.get_base_url()
+    base_url = _raw_url.rstrip("/")[:-4] if (_raw_url or "").rstrip("/").endswith("/api") else _raw_url
 
     if not api_key or not workspace_id:
         print("mima status: not logged in. Run `mima login` first.", file=sys.stderr)
@@ -1291,7 +1292,10 @@ def _cmd_push(args: List[str]) -> None:
     import os
     api_key      = os.environ.get("MIMA_API_KEY")      or config.get_api_key()
     workspace_id = os.environ.get("MIMA_WORKSPACE_ID") or config.get_workspace_id()
-    base_url     = os.environ.get("MIMA_BASE_URL")     or config.get_base_url()
+    # Accept either MIMA_BASE_URL (no /api suffix) or MIMA_API_URL (with /api suffix).
+    # Normalise: this command appends /api itself, so strip trailing /api if present.
+    _raw_url = os.environ.get("MIMA_BASE_URL") or os.environ.get("MIMA_API_URL") or config.get_base_url()
+    base_url = _raw_url.rstrip("/")[:-4] if (_raw_url or "").rstrip("/").endswith("/api") else _raw_url
     system_name  = os.environ.get("MIMA_SYSTEM_NAME",  "mima-cli")
 
     if not api_key or not workspace_id:
