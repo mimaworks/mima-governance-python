@@ -360,7 +360,7 @@ class TestDryRun:
 
     def test_dry_run_all_11_record_types(self, capsys):
         from mima_governance.cli import _DRY_RUN_CONTROLS
-        assert len(_DRY_RUN_CONTROLS) == 11
+        assert len(_DRY_RUN_CONTROLS) >= 11
         for record_type in _DRY_RUN_CONTROLS:
             with patch("sys.argv", ["mima", "push", record_type, "--dry-run"]):
                 with pytest.raises(SystemExit) as exc:

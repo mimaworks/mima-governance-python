@@ -295,6 +295,8 @@ class TestCmdPush:
             "--system", "loan-scoring-v2",
             "--risk-tier", "high",
             "--use-case", "credit_scoring",
+            "--intended-purpose", "Automated credit scoring for loan applications",
+            "--annex-iii-category", "essential_services",
             "--impact-domains", "employment,credit",
             "--art5-self-assessment", "true",
             "--assessor", "j.smith@co.com",
@@ -304,7 +306,7 @@ class TestCmdPush:
 
         sent = mock_post.call_args[1]["json"]
         assert sent["record_type"] == "ai_risk_assessment"
-        assert sent["payload"]["risk_tier"] == "high"
+        assert sent["payload"]["risk_level"] == "high"
         assert sent["payload"]["art5_self_assessment"] is True
         assert sent["payload"]["impact_domains"] == ["employment", "credit"]
         assert "rec-ara-1" in capsys.readouterr().out
@@ -317,7 +319,8 @@ class TestCmdPush:
         with patch("sys.argv", [
             "mima", "push", "ai_risk_assessment",
             "--system", "sys", "--risk-tier", "extreme",
-            "--use-case", "x", "--impact-domains", "x",
+            "--use-case", "x", "--intended-purpose", "Test",
+            "--impact-domains", "x",
             "--art5-self-assessment", "true", "--assessor", "a",
         ]):
             with pytest.raises(SystemExit) as exc:

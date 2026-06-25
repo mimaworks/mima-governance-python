@@ -298,22 +298,25 @@ class TestAiRiskAssessment:
                 "loan-scoring-v2",
                 "high",
                 "credit_scoring",
+                intended_purpose="Automated credit scoring for loan applications",
+                annex_iii_category="essential_services",
                 impact_domains=["employment", "credit"],
                 art5_self_assessment=True,
                 assessor="j.smith@co.com",
             )
         record: GrcRecord = mock_push.call_args[0][0]
         assert record.record_type == "ai_risk_assessment"
-        assert record.payload["risk_tier"] == "high"
+        assert record.payload["risk_level"] == "high"
         assert record.payload["art5_self_assessment"] is True
         assert record.payload["impact_domains"] == ["employment", "credit"]
-        assert record.payload["assessor"] == "j.smith@co.com"
+        assert record.identity == "j.smith@co.com"
         assert record.resource == "loan-scoring-v2"
 
     def test_invalid_risk_tier_raises_value_error(self, client):
         with pytest.raises(ValueError, match="risk_tier"):
             client.ai_risk_assessment(
                 "sys", "dangerous", "use",
+                intended_purpose="Test",
                 impact_domains=[], art5_self_assessment=True, assessor="a",
             )
 
@@ -322,6 +325,7 @@ class TestAiRiskAssessment:
             with pytest.raises(ValueError):
                 client.ai_risk_assessment(
                     "sys", "bad", "use",
+                    intended_purpose="Test",
                     impact_domains=[], art5_self_assessment=False, assessor="a",
                 )
             mock_push.assert_not_called()
@@ -332,15 +336,19 @@ class TestAiRiskAssessment:
                 mock_push.return_value = GrcResult("id", "ai_risk_assessment", [], "ok")
                 client.ai_risk_assessment(
                     "sys", tier, "use",
+                    intended_purpose="Test purpose",
+                    annex_iii_category="employment_management" if tier == "high" else None,
                     impact_domains=[], art5_self_assessment=True, assessor="a",
                 )
-                assert mock_push.call_args[0][0].payload["risk_tier"] == tier
+                assert mock_push.call_args[0][0].payload["risk_level"] == tier
 
     def test_optional_fields_included_when_supplied(self, client):
         with patch.object(client, "_push_grc") as mock_push:
             mock_push.return_value = GrcResult("id", "ai_risk_assessment", [], "ok")
             client.ai_risk_assessment(
                 "sys", "high", "use",
+                intended_purpose="Test purpose",
+                annex_iii_category="employment_management",
                 impact_domains=[],
                 art5_self_assessment=True,
                 assessor="a",

@@ -114,6 +114,8 @@ class TestAsyncGrcMethods:
         )
         result = await async_client.ai_risk_assessment(
             "loan-model", "high", "credit_scoring",
+            intended_purpose="Automated credit scoring for loan applications",
+            annex_iii_category="essential_services",
             impact_domains=["credit"],
             art5_self_assessment=True,
             assessor="j.smith@co.com",
@@ -377,6 +379,7 @@ class TestAsyncValidation:
         with pytest.raises(ValueError, match="risk_tier"):
             await async_client.ai_risk_assessment(
                 "sys", "extreme", "uc",
+                intended_purpose="Test",
                 impact_domains=["x"],
                 art5_self_assessment=True,
                 assessor="a",
