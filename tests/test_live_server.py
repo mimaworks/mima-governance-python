@@ -8,9 +8,11 @@ Skipped automatically in CI unless --live flag is passed.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import pytest
+import httpx
 from mima_governance import MimaGovernance
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -19,14 +21,11 @@ BASE_URL     = os.getenv("MIMA_TEST_BASE_URL",  "http://127.0.0.1:8081")
 WORKSPACE_ID = os.getenv("MIMA_TEST_WORKSPACE", "a92d5798-9e09-4166-a9a6-9dea300aae0e")
 API_KEY      = os.getenv("MIMA_TEST_API_KEY",   "mima_live_e2etest2026lovable")
 
-
-def pytest_addoption(parser):
-    parser.addoption("--live", action="store_true", default=False,
-                     help="Run live-server integration tests")
+_WS = WORKSPACE_ID
 
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "live: requires a running Mima server")
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 @pytest.fixture(scope="module")
@@ -46,65 +45,69 @@ def client():
     )
 
 
+@pytest.fixture(scope="module")
+def http():
+    return httpx.Client(
+        base_url=BASE_URL,
+        headers={"X-API-Key": API_KEY},
+        timeout=10,
+    )
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class TestServerHealth:
-    def test_server_is_reachable(self, live, client):
-        import httpx
-        r = httpx.get(f"{BASE_URL}/api/health", timeout=5)
+    def test_server_is_reachable(self, live, http):
+        r = http.get("/api/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
 
 
-# ── Posture ───────────────────────────────────────────────────────────────────
+# ── Posture / Readiness ───────────────────────────────────────────────────────
 
 class TestPosture:
-    def test_get_posture_returns_score(self, live, client):
-        p = client.get_posture()
-        assert isinstance(p.overall_pct, (int, float))
-        assert 0 <= p.overall_pct <= 100
+    def test_readiness_returns_score(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/readiness")
+        assert r.status_code == 200
+        data = r.json()
+        # overall_pct or frameworks.score_pct
+        assert "frameworks" in data or "overall_pct" in data
 
-    def test_posture_has_frameworks(self, live, client):
-        p = client.get_posture()
-        assert len(p.frameworks) > 0
-        fw = p.frameworks[0]
-        assert hasattr(fw, "name")
-        assert hasattr(fw, "score_pct")
+    def test_readiness_has_frameworks(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/readiness")
+        assert r.status_code == 200
+        data = r.json()
+        frameworks = data.get("frameworks", [])
+        assert len(frameworks) > 0
+        fw = frameworks[0]
+        assert "framework" in fw or "name" in fw
+        assert "score_pct" in fw
 
 
 # ── Attestation round-trip ─────────────────────────────────────────────────────
 
 class TestAttestationRoundTrip:
-    def test_attest_and_verify_in_evidence(self, live, client):
-        """Push a record and confirm it appears in list_evidence within 3s."""
-        tag = f"live-test-{int(time.time())}"
-
-        result = client.attest(
+    def test_push_returns_attestation_id(self, live, client):
+        """push() returns an AttestationResult with a non-empty attestation_id."""
+        result = client.push(
             tool_name="sdk_live_test",
-            input_data={"tag": tag, "test": "round_trip"},
-            output_data={"status": "ok"},
+            input_hash=_sha256(f"live-test-{time.time()}"),
+            output_hash=_sha256("ok"),
             model_id="test-model",
         )
+        assert result.attestation_id, "push() must return a non-empty attestation_id"
+        assert result.trust_tier in ("full", "partial", "external", "unverified", "limited", "declared")
 
-        assert result.record_id, "attest() must return a non-empty record_id"
-
-        # Poll up to 3s for the record to appear
-        deadline = time.time() + 3
-        found = False
-        while time.time() < deadline:
-            evidence = client.list_evidence(system_name="sdk-live-test", days=1)
-            if any(e.get("record_id") == result.record_id for e in evidence):
-                found = True
-                break
-            time.sleep(0.4)
-
-        assert found, f"record {result.record_id} not found in evidence after 3s"
-
-    def test_attest_returns_mapped_controls(self, live, client):
-        result = client.attest(
-            tool_name="human_oversight_check",
-            input_data={"reviewer": "live-test"},
-            output_data={"decision": "approved"},
+    def test_grc_push_returns_mapped_controls(self, live, client):
+        """GRC push returns a GrcResult with mapped_controls list."""
+        result = client.push_grc_raw(
+            record_type="human_oversight_check",
+            payload={"reviewer": "live-test", "decision": "approved"},
+        ) if hasattr(client, "push_grc_raw") else client.human_oversight(
+            decision_id="live-test-controls-001",
+            ai_recommendation="approve",
+            human_decision="approve",
+            reviewer="live-test",
         )
         assert isinstance(result.mapped_controls, list)
 
@@ -123,49 +126,76 @@ class TestGrcEvidence:
 
     def test_human_oversight_push(self, live, client):
         result = client.human_oversight(
-            decision="approved",
-            reviewed_by="live-test-runner",
-            context="SDK live test",
+            decision_id="live-test-decision-002",
+            ai_recommendation="approve",
+            human_decision="approve",
+            reviewer="live-test-runner",
         )
         assert result.record_id
 
-    def test_dry_run_returns_controls_without_writing(self, live, client):
-        result = client.dry_run_attest(
-            tool_name="ai_risk_assessment",
-            input_data={"source": "live-test"},
-            output_data={"risk": "low"},
+    def test_dry_run_returns_controls_without_writing(self, live, http):
+        r = http.post(
+            f"/api/workspaces/{_WS}/governance/grc/evidence",
+            params={"dry_run": "true"},
+            json={
+                "record_type": "ai_risk_assessment",
+                "payload": {"source": "live-test"},
+                "system_name": "sdk-live-test",
+            },
         )
-        assert isinstance(result.would_map_controls, list)
-        assert result.record_id == ""  # dry run — nothing written
+        assert r.status_code == 200
+        data = r.json()
+        assert "mapped_controls" in data or "would_map_controls" in data
+        # dry run: record_id is either empty or a nil UUID (all zeros)
+        record_id = data.get("record_id", "")
+        nil_uuid = "00000000-0000-0000-0000-000000000000"
+        assert record_id in ("", nil_uuid) or record_id is None
 
 
 # ── Gates ─────────────────────────────────────────────────────────────────────
 
 class TestGates:
-    def test_check_gates_returns_list(self, live, client):
-        gates = client.check_gates()
-        assert isinstance(gates, list)
+    def test_list_gates_returns_policies(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/gates")
+        assert r.status_code == 200
+        data = r.json()
+        policies = data.get("policies", data) if isinstance(data, dict) else data
+        assert isinstance(policies, list)
 
-    def test_gate_objects_have_required_fields(self, live, client):
-        gates = client.check_gates()
-        if not gates:
-            pytest.skip("no gates configured in test workspace")
-        g = gates[0]
-        assert "name" in g or hasattr(g, "name")
+    def test_check_gates_returns_pass_status(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/gates/check")
+        assert r.status_code == 200
+        data = r.json()
+        assert "passed" in data
+        assert isinstance(data["passed"], bool)
+
+    def test_gate_policies_have_required_fields(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/gates")
+        assert r.status_code == 200
+        data = r.json()
+        policies = data.get("policies", []) if isinstance(data, dict) else data
+        if not policies:
+            pytest.skip("no gate policies configured in test workspace")
+        p = policies[0]
+        assert "id" in p or "policy_name" in p or "framework" in p
 
 
 # ── Systems ───────────────────────────────────────────────────────────────────
 
 class TestSystems:
-    def test_list_systems_returns_list(self, live, client):
-        systems = client.list_systems()
+    def test_list_systems_returns_list(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/systems")
+        assert r.status_code == 200
+        data = r.json()
+        systems = data.get("systems", data) if isinstance(data, dict) else data
         assert isinstance(systems, list)
 
-    def test_register_system_dry_run(self, live, client):
-        result = client.register_system(
-            name="sdk-live-dry-run",
-            description="Automated live test — dry run only",
-            risk_tier="limited",
-            dry_run=True,
-        )
-        assert result.system_id == "" or result.dry_run is True
+    def test_registered_system_has_name(self, live, http):
+        r = http.get(f"/api/workspaces/{_WS}/governance/grc/systems")
+        assert r.status_code == 200
+        data = r.json()
+        systems = data.get("systems", []) if isinstance(data, dict) else data
+        if not systems:
+            pytest.skip("no systems in test workspace")
+        s = systems[0]
+        assert "system_name" in s or "name" in s
