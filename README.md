@@ -119,15 +119,14 @@ mima = MimaGovernance(
 # Every attestation records WHO authorised the agent to act
 ```
 
-## How inferred evidence works
+## Inferred vs attested evidence
 
-The Mima platform runs a nightly job (03:45 UTC) that reads AI system classifications already in the estate — from cloud integrations and CMDB data you have already connected — and converts them into evidence records with `source = 'estate_auto'`. No network scanning. No discovery beyond what's already in your connected estate.
+Evidence records have a `source` field. Two values matter for audit weight:
 
-**What inferred evidence is:** the AI risk classification process (tier determination, prohibited-use check) is itself a real risk assessment. It honestly evidences `EUAIA_ART9`, `EUAIA_ART11`, and related controls.
+- `sdk` — written by your code via `@mima.attest()` or a GRC method. Full audit weight. Required for formal submissions.
+- `estate_auto` — written by the Mima platform based on system registrations already in your workspace. Marked "indicative only" in the dashboard until a workspace admin validates the control list.
 
-**What it is not:** proof that anyone evaluated model accuracy, governed training data, or operated a human oversight mechanism. The bridge explicitly does not generate `model_evaluation`, `training_data_governance`, or `human_oversight` records — auto-generating those would produce false evidence.
-
-Inferred records are marked "indicative only" in the dashboard until a workspace admin validates the control list. SDK-attested records (`source = 'sdk'`) carry higher weight and are required for formal audit submissions.
+Controls covered only by `estate_auto` records are counted in your readiness score but flagged as inferred. A control needs at least one `sdk`-sourced record to be fully evidenced for audit purposes.
 
 ## Scan limitations
 
@@ -147,9 +146,11 @@ When `mima scan` reports zero unattested calls, the AST scanner found none in re
 
 ## Readiness score — how it's calculated
 
-`overall_pct` is the **minimum** across all frameworks with defined controls (weakest-link). If SOC 2 is at 80% and EU AI Act is at 30%, `overall_pct` is 30. A certification chain is only as strong as its weakest framework; averaging would overstate readiness.
+`overall_pct` is the **controls-weighted average** across all frameworks: `sum(controls_covered) / sum(controls_required) × 100`. A framework with more required controls has proportionally more influence on the overall score.
 
 Per-framework `score_pct` = `controls_covered / controls_required × 100`.
+
+Use per-framework scores to identify which framework is dragging your overall number — the dashboard shows this breakdown directly.
 
 ## Credential storage
 
