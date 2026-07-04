@@ -10,12 +10,21 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{ name = "Mima", email = "sdk@mima.works" }]
-keywords = ["ai", "governance", "attestation", "eu-ai-act", "compliance"]
+keywords = ["ai", "governance", "attestation", "eu-ai-act", "iso-42001", "soc2", "nist-ai-rmf", "compliance", "grc", "langchain", "autogen"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Security",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
 dependencies = [
     "httpx>=0.24",
